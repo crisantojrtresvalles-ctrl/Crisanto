@@ -1,3 +1,4 @@
+import { HistoryScene } from "./HistoryScene";
 import { Composition, staticFile } from "remotion";
 import { Scene, myCompSchema } from "./Scene";
 import { getMediaMetadata } from "./helpers/get-media-metadata";
@@ -20,6 +21,15 @@ import { getMediaMetadata } from "./helpers/get-media-metadata";
 export const RemotionRoot: React.FC = () => {
   return (
     <>
+      <Composition
+        id="HistoryPrototype"
+        component={HistoryScene}
+        fps={30}
+        durationInFrames={1800}
+        width={1080}
+        height={1920}
+        defaultProps={{}}
+      />
       <Composition
         id="Scene"
         component={Scene}
