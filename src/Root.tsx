@@ -1,8 +1,6 @@
+import React from "react";
+import { Composition, staticFile } from "remotion";
 import { HistoryScene } from "./HistoryScene";
-import { Composition, staticFile } from "remotion";
-import { HistoryVideo, type HistoryProps } from "./history/HistoryVideo";
-	mport { HistoryScene } from "./HistoryScene";
-import { Composition, staticFile } from "remotion";
 import { Scene, myCompSchema } from "./Scene";
 import { HistoryVideo, type HistoryProps } from "./history/HistoryVideo";
 import { getMediaMetadata } from "./helpers/get-media-metadata";
