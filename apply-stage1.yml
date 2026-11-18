@@ -1,0 +1,23 @@
+name: Apply Stage 1 patch
+
+# One-time helper. Run it from the Actions tab. It creates the branch "cinematic-stage1"
+# from master, applies cinematic-stage1.patch, and pushes the branch.
+on: workflow_dispatch
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Apply the patch on a new branch and push it
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout -b cinematic-stage1
+          git apply --exclude=.github/workflows/render-cinematic.yml cinematic-stage1.patch
+          git add -A
+          git commit -m "Stage 1: pre-render QC, staged renderer, episode 001 fixes"
+          git push origin cinematic-stage1

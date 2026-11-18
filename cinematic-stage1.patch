@@ -1,0 +1,1530 @@
+diff --git a/.github/workflows/render-cinematic.yml b/.github/workflows/render-cinematic.yml
+new file mode 100644
+index 0000000..f0c95cb
+--- /dev/null
++++ b/.github/workflows/render-cinematic.yml
+@@ -0,0 +1,70 @@
++name: Render History Video (staged + QC)
++
++# Manual only. The original "Render History Video" workflow is unchanged and still works.
++# This one runs the pre-render QC gate, renders in cached chunks, stitches and verifies the result.
++on:
++  workflow_dispatch:
++    inputs:
++      chunk_seconds:
++        description: Seconds per render stage (smaller = less memory, finer resume points)
++        default: "15"
++      ignore_qc:
++        description: Render even if the QC reports errors
++        type: boolean
++        default: false
++
++concurrency:
++  group: render-cinematic-${{ github.ref }}
++  cancel-in-progress: true
++
++jobs:
++  render:
++    runs-on: ubuntu-latest
++    timeout-minutes: 120
++    steps:
++      - uses: actions/checkout@v4
++      - uses: actions/setup-node@v4
++        with:
++          node-version: 22
++          cache: npm
++      - run: npm ci
++      - name: Install narration voice + ffmpeg
++        run: |
++          sudo apt-get update
++          sudo apt-get install -y espeak-ng ffmpeg
++      - name: Generate audio (music, sfx, narration)
++        env:
++          ELEVENLABS_API_KEY: ${{ secrets.ELEVENLABS_API_KEY }}
++          ELEVENLABS_VOICE_ID: ${{ secrets.ELEVENLABS_VOICE_ID }}
++        run: node scripts/generate-audio.mjs
++      - run: npx remotion browser ensure
++      - name: Type check
++        run: npx tsc --noEmit
++      - name: QC self-test (does the QC itself still catch known faults?)
++        run: node scripts/qc-selftest.mjs
++      - name: Pre-render QC (data)
++        run: node scripts/qc.mjs
++      - name: Pre-render QC (pixels, report only)
++        run: node scripts/qc-frames.mjs --every 3
++        continue-on-error: true
++      - name: Restore render cache
++        uses: actions/cache@v4
++        with:
++          path: out/chunks
++          key: chunks-${{ github.sha }}
++          restore-keys: chunks-
++      - name: Staged render
++        run: node scripts/render-staged.mjs --chunk-seconds ${{ inputs.chunk_seconds }} --out out/history-pirates.mp4 ${{ inputs.ignore_qc && '--ignore-qc' || '' }}
++      - uses: actions/upload-artifact@v4
++        if: always()
++        with:
++          name: qc-reports
++          path: |
++            out/qc/*.txt
++            out/qc/*.json
++            out/qc/frames/*.jpg
++            out/render-manifest.json
++      - uses: actions/upload-artifact@v4
++        with:
++          name: history-pirates
++          path: out/history-pirates.mp4
+diff --git a/docs/ENGINE.md b/docs/ENGINE.md
+new file mode 100644
+index 0000000..dda9240
+--- /dev/null
++++ b/docs/ENGINE.md
+@@ -0,0 +1,62 @@
++# History video engine: cinematic upgrade (Stage 1)
++
++Vertical 720x1280, 30 fps, 60 s episodes built with Remotion + React Three Fiber. 2D rigged characters stand inside a procedural 3D world.
++
++## Pipeline
++
++```
++src/history/episodes/<ep>.ts   one Episode = data only (ships, islands, chars, camera keys, atmosphere, fx, transitions, narration, sfx, story)
++        |
++        |-- node scripts/qc.mjs            pre-render QC on the data (no GPU, ~0.3 s)
++        |-- node scripts/qc-frames.mjs     pixel QC on real stills (needs Chromium + ffmpeg, ~3 s per still)
++        |
++        `-- node scripts/render-staged.mjs QC gate -> render in cached chunks -> stitch -> verify
++```
++
++The original commands still work unchanged (`npx remotion render ...`, `scripts/dev/stills.mjs`, the "Render History Video" workflow).
++
++## What the QC checks (`src/history/qc/`)
++
++| Check | What it verifies | How |
++|---|---|---|
++| script | hook starts <= 1 s and reads as a hook; a year/setting is spoken <= 15 s; pace 1.5-3.6 words/s; no overlap; story beats (hook, setting, conflict, twist, resolution) present, ordered, twist at 55-92 % of runtime; protagonist exists and appears in >= 3 scenes; scenes are >= 50 % narrated (no filler) | `ep.story`, narration, sampled camera |
++| camera | every frame sampled: scene jumps found and checked against transitions (unmasked = **hard cut** error, violent whip-pan = warning); scene changes per 10 s; shot types (wide/medium/close-up/detail); first face on screen; FOV range and zoom speed; camera below water / inside terrain / inside a character | pure maths on the camera spline, wave and terrain functions |
++| lighting | no weak light; sun on horizon; sudden unmasked light pops; **light changes when the story turns** (conflict/escalation/twist); warm and cool mix; low sun present | atmosphere keys vs. transitions and story beats |
++| scene | all references resolve; duplicates; ship/character scale; characters inside hull footprint / on an island; density (elements in frame per second, sparse runs) | frustum projection of every entity |
++| characters | valid colours, shared proportion ranges, distinct named cast, action flicker, expression range, **no blinking or bouncing while talking**, pose pops | `poseAt` sampled per frame |
++| audio | narration audio fits its slot (needs `manifest.json`), every fx has a sound cue, every transition a whoosh, referenced files exist, cue pile-ups | manifest + sfx list |
++| pixels (`qc-frames`) | washed-out, crushed, flat-contrast, colourless frames. Frames inside a scene-change wipe are skipped | ffmpeg `signalstats` on overlay-free stills (`plain` prop) |
++
++Findings are `error` (blocks rendering), `warn` (flag) or `info`. Reports go to `out/qc/<episode>.txt|json`. Thresholds live in `src/history/qc/util.ts` (`DEFAULTS`); they are heuristics calibrated on episode 001 and the reference video (0.4 scene changes per 10 s, ~13 s shots, first face before ~8 s), so tune them.
++
++`node scripts/qc-selftest.mjs` injects 13 known faults into a copy of the episode and asserts the QC catches each one. Run it after touching the QC.
++
++## Staged rendering (`scripts/render-staged.mjs`)
++
++- Runs the QC gate first. Errors stop the render (`--ignore-qc` overrides).
++- Renders `--chunk-seconds` (default 15) per stage. Each chunk is cached in `out/chunks/` under a hash of source + audio + settings, so a re-run resumes and a small edit re-renders only the stages whose hash changed (in practice any `src/` edit changes all hashes; per-scene hashing is a Stage 2 item).
++- Retries a failed chunk (`--retries`, relaunches Chromium), keeps finished chunks, exits non-zero listing what failed.
++- Stitches without re-encoding video; audio is joined as exact PCM and AAC-encoded once (plain MP4 `-c copy` gave a variable frame rate and padded audio at the seams). Verifies size, fps, duration, audio.
++- Free tooling only: Remotion, Chromium, ffmpeg. Use `--concurrency 1` on small machines.
++- `.github/workflows/render-cinematic.yml` runs all of it on GitHub Actions (manual trigger, caches chunks).
++
++## Writing a new episode
++
++1. Copy `episodes/pirates.ts`; fill `story` first (logline, setting + year, protagonist, supporting, beats with times).
++2. Write narration so a year/place is spoken in the first 15 s and the hook is a question or number.
++3. Build ships/islands/chars, then camera keys. For every scene change use an object wipe in `transitions` plus a whoosh in `sfx`.
++4. `npm run qc` until no errors; `node scripts/dev/stills.mjs <frames>` to look; `npm run qc:frames`; then render.
++5. Register the episode in `scripts/qc.mjs` (`registry`) and in `HistoryVideo.tsx`.
++
++## Status: what is and is not implemented
++
++| Area | Status |
++|---|---|
++| Script structure validation | **Done** (story plan + checks). Not done: generating scripts from a topic. |
++| Camera system | Existing: spline rig, tracking, orbit, whip, shake, zoom, motion blur. **Added:** verification (hard cuts, shot variety, zoom speed, safety). |
++| Seamless transitions | Existing: object wipes. **Added:** a checker that finds unmasked jumps. Fixed 2 in episode 001. 2 violent whip-pans remain as warnings. |
++| Lighting | Existing: sun, ambient, fog, storm, flashes. **Added:** continuity and story-alignment checks. **Not done:** night lighting / environment light sources (lanterns, fires), rim-light control. |
++| Environment | Ocean, sky, ships, islands (palms, houses, fort), gulls only. **Not done:** streets, buildings, interiors, furniture, props, land terrain. This is the largest gap for non-naval stories. |
++| Characters | Existing: 2.5D rig, looks, poses, expressions. **Fixed:** blinking while talking. **Not done:** a shared character library file; real lip-sync (mouth is a sine wave, not the audio). |
++| QC | **Done** (data + pixel + self-test). Not done: transition-continuity pixel diff, per-surface texture analysis. |
++| Rendering | **Done:** staged, cached, retrying, verified. Verified: chunk stitch, seam audio, cache hit. **Not verified:** Chromium-crash recovery under test; the new GitHub workflow has not run on Actions. |
+diff --git a/package.json b/package.json
+index 39b735a..41ea04a 100644
+--- a/package.json
++++ b/package.json
+@@ -35,7 +35,11 @@
+     "dev": "remotion studio",
+     "build": "remotion bundle",
+     "upgrade": "remotion upgrade",
+-    "lint": "eslint src && tsc"
++    "lint": "eslint src && tsc",
++    "qc": "node scripts/qc.mjs",
++    "qc:test": "node scripts/qc-selftest.mjs",
++    "qc:frames": "node scripts/qc-frames.mjs",
++    "render:staged": "node scripts/render-staged.mjs"
+   },
+   "allowScripts": {
+     "esbuild": false
+diff --git a/scripts/qc-frames.mjs b/scripts/qc-frames.mjs
+new file mode 100644
+index 0000000..ed8e64b
+--- /dev/null
++++ b/scripts/qc-frames.mjs
+@@ -0,0 +1,64 @@
++#!/usr/bin/env node
++// Pixel-level QC. Renders plain (overlay-free) stills of the actual 3D world and measures them with ffmpeg:
++// blank / washed-out frames, flat lighting, missing surface detail. Needs Chromium + ffmpeg (both present in CI).
++//   node scripts/qc-frames.mjs                    -> a still every 2 s
++//   node scripts/qc-frames.mjs --every 1 --strict
++//   node scripts/qc-frames.mjs --at 3.6,16.2      -> only these times (seconds)
++import fs from "node:fs";
++import path from "node:path";
++import { execFileSync } from "node:child_process";
++import { bundle } from "@remotion/bundler";
++import { renderStill, selectComposition, openBrowser } from "@remotion/renderer";
++
++const args = process.argv.slice(2);
++const val = (f, d) => { const i = args.indexOf(f); return i >= 0 ? args[i + 1] : d; };
++const every = Number(val("--every", 2));
++const fps = 30, dur = 60;
++const times = val("--at", null) ? val("--at").split(",").map(Number) : Array.from({ length: Math.floor(dur / every) }, (_, i) => +(0.5 + i * every).toFixed(2)).filter((t) => t < dur - 0.4);
++const GL = process.env.GL ?? "swangle";
++const OUT = "out/qc/frames";
++fs.rmSync(OUT, { recursive: true, force: true });
++fs.mkdirSync(OUT, { recursive: true });
++
++const chrome = [process.env.CHROME_PATH, "/opt/pw-browsers/chromium-1243/chrome-linux64/chrome", "/usr/bin/google-chrome"].find((p) => p && fs.existsSync(p));
++const serveUrl = await bundle({ entryPoint: path.resolve("src/index.ts"), onProgress: () => {} });
++const browser = await openBrowser("chrome", { browserExecutable: chrome ?? undefined, chromiumOptions: { gl: GL } });
++const inputProps = { durations: null, audio: false, plain: true };
++const comp = await selectComposition({ serveUrl, id: "History", inputProps, puppeteerInstance: browser });
++
++// ---- measurement: luma percentiles + edge density, via ffmpeg signalstats ----
++const stats = (file) => {
++  const run = (vf) => execFileSync("ffmpeg", ["-v", "error", "-i", file, "-vf", `scale=240:-1,${vf},signalstats,metadata=print:file=-`, "-f", "null", "-"], { encoding: "utf8" });
++  const pick = (txt, k) => Number(new RegExp(`lavfi.signalstats.${k}=([0-9.]+)`).exec(txt)?.[1] ?? NaN);
++  const a = run("format=yuv420p"), e = run("edgedetect=low=0.08:high=0.2,format=yuv420p");
++  return { yavg: pick(a, "YAVG"), ylow: pick(a, "YLOW"), yhigh: pick(a, "YHIGH"), sat: pick(a, "SATAVG"), edge: pick(e, "YAVG") / 255 };
++};
++
++const TH = { lumaMin: 30, lumaMax: 225, contrastMin: 45, edgeMin: 0.012, satMin: 5 };
++// frames that a scene-change wipe intentionally fills (white spray, smoke, hull) must not be judged
++import { execFileSync as _x } from "node:child_process";
++_x("node", ["scripts/qc.mjs"], { stdio: "ignore" });
++const wipes = JSON.parse(fs.readFileSync("out/qc/ep001-pirate-ships.json", "utf8")).transitions;
++const rows = [];
++const bad = [];
++for (const t of times) {
++  const frame = Math.round(t * fps);
++  if (wipes.some((w) => Math.abs(t - w.t) <= w.dur / 2 + 0.1)) { console.log(`t=${t.toFixed(2)}s  skipped (inside a scene-change wipe)`); continue; }
++  const f = path.join(OUT, `t${t.toFixed(2)}.jpg`);
++  await renderStill({ composition: comp, serveUrl, output: f, frame, inputProps, puppeteerInstance: browser, imageFormat: "jpeg", jpegQuality: 85, chromiumOptions: { gl: GL }, timeoutInMilliseconds: 120000 });
++  const s = stats(f);
++  const contrast = s.yhigh - s.ylow;
++  const issues = [];
++  if (s.yavg > TH.lumaMax) issues.push("washed out / blown highlights");
++  if (s.yavg < TH.lumaMin) issues.push("crushed / too dark");
++  if (contrast < TH.contrastMin) issues.push(`flat lighting (contrast ${contrast.toFixed(0)})`);
++  if (s.edge < TH.edgeMin) issues.push(`no surface detail (edge density ${s.edge.toFixed(3)})`);
++  if (s.sat < TH.satMin) issues.push(`colourless (sat ${s.sat.toFixed(1)})`);
++  rows.push({ t, ...s, contrast, issues });
++  if (issues.length) bad.push({ t, issues });
++  console.log(`t=${t.toFixed(2)}s  luma=${s.yavg.toFixed(0)} contrast=${contrast.toFixed(0)} edge=${s.edge.toFixed(3)} sat=${s.sat.toFixed(0)}  ${issues.length ? "FLAG: " + issues.join("; ") : "ok"}`);
++}
++await browser.close(() => {}, true);
++fs.writeFileSync(path.join("out/qc", "frames.json"), JSON.stringify({ thresholds: TH, rows, flagged: bad }, null, 1));
++console.log(`\n${times.length} frames checked, ${bad.length} flagged. Stills + frames.json in ${OUT}/`);
++if (args.includes("--strict") && bad.length) process.exit(1);
+diff --git a/scripts/qc-selftest.mjs b/scripts/qc-selftest.mjs
+new file mode 100644
+index 0000000..746ad31
+--- /dev/null
++++ b/scripts/qc-selftest.mjs
+@@ -0,0 +1,81 @@
++#!/usr/bin/env node
++// Self-test for the QC system: inject known defects into a copy of the episode and assert the QC catches each one.
++//   node scripts/qc-selftest.mjs
++import fs from "node:fs";
++import path from "node:path";
++import assert from "node:assert/strict";
++import { pathToFileURL } from "node:url";
++import { build } from "esbuild";
++
++fs.mkdirSync("out/qc", { recursive: true });
++const entry = path.resolve("out/qc/.selftest-entry.ts");
++fs.writeFileSync(entry, `export { runQC } from "../../src/history/qc/index";\nexport { pirates } from "../../src/history/episodes/pirates";\n`);
++const outfile = path.resolve("out/qc/.selftest-bundle.mjs");
++await build({ entryPoints: [entry], outfile, bundle: true, platform: "node", format: "esm", packages: "external", jsx: "automatic", logLevel: "error" });
++const { runQC, pirates } = await import(pathToFileURL(outfile).href + "?v=" + Date.now());
++
++const clone = () => structuredClone(pirates);
++const qc = (ep) => runQC(ep, { aspect: 720 / 1280, durations: null, audioFiles: null });
++const has = (r, check, sev, re) => r.findings.some((f) => f.check === check && f.severity === sev && re.test(f.msg));
++const base = qc(pirates);
++let n = 0;
++const test = (name, fn) => { try { fn(); n++; console.log("  ok   " + name); } catch (e) { console.error("  FAIL " + name + "\n       " + e.message); process.exitCode = 1; } };
++
++test("baseline episode is analysed (shots, metrics present)", () => {
++  assert.ok(base.shots.length >= 8); assert.equal(typeof base.metrics.cutsPer10s, "number");
++});
++test("removing a transition exposes a hard cut", () => {
++  const ep = clone(); ep.transitions = ep.transitions.filter((t) => t.t !== 34.2);
++  const r = qc(ep); assert.ok(r.findings.filter((f) => f.severity === "error" && /Hard cut/.test(f.msg)).length > base.findings.filter((f) => f.severity === "error" && /Hard cut/.test(f.msg)).length);
++});
++test("camera key pointing at an unknown entity is an error", () => {
++  const ep = clone(); ep.cameras[3].target = "nope"; ep.cameras[3].rel = true;
++  assert.ok(!qc(ep).ok);
++});
++test("camera sunk under the sea is an error", () => {
++  const ep = clone(); ep.cameras = ep.cameras.map((k) => (k.t >= 8 && k.t <= 9 ? { ...k, target: undefined, pos: [400, -5, 0], look: [400, 3, 20] } : k));
++  assert.ok(has(qc(ep), "camera", "error", /below the water/));
++});
++test("overlapping narration is an error", () => {
++  const ep = clone(); ep.narration[1].start = ep.narration[0].end - 1;
++  assert.ok(has(qc(ep), "script", "error", /overlaps/));
++});
++test("narration read too fast is flagged", () => {
++  const ep = clone(); ep.narration[2].end = ep.narration[2].start + 2;
++  assert.ok(has(qc(ep), "script", "warn", /too fast/));
++});
++test("missing story beat is an error", () => {
++  const ep = clone(); ep.story.beats = ep.story.beats.filter((b) => b.kind !== "twist");
++  assert.ok(has(qc(ep), "script", "error", /no "twist" beat/));
++});
++test("no story plan is flagged", () => {
++  const ep = clone(); delete ep.story;
++  assert.ok(has(qc(ep), "script", "warn", /no `story` plan/));
++});
++test("unknown protagonist is an error", () => {
++  const ep = clone(); ep.story.protagonist = "ghost";
++  assert.ok(has(qc(ep), "script", "error", /not a character/));
++});
++test("sudden unmasked light pop is flagged", () => {
++  const ep = clone(); ep.atmo = ep.atmo.map((a) => (a.t >= 41.8 && a.t < 54 ? { ...a, sunI: 0.05, ambI: 0.1 } : a));
++  assert.ok(qc(ep).findings.some((f) => f.check === "lighting" && f.severity !== "info"));
++});
++test("character outside the hull is an error", () => {
++  const ep = clone(); ep.chars[0].local = [9, 1.5, 0];
++  assert.ok(has(qc(ep), "scene", "error", /outside the .* hull/));
++});
++test("cannon event without sound cue is flagged", () => {
++  const ep = clone(); ep.sfx = ep.sfx.filter((s) => s.file !== "cannon.wav");
++  assert.ok(has(qc(ep), "audio", "warn", /cannon event/));
++});
++test("audio duration longer than its slot is caught when the manifest exists", () => {
++  const ep = clone(); const d = Object.fromEntries(ep.narration.map((n) => [n.id, n.end - n.start])); d.n02 = 12;
++  const r = runQC(ep, { aspect: 720 / 1280, durations: d, audioFiles: null });
++  assert.ok(has(r, "audio", "error", /runs into/));
++});
++test("blink is suppressed while talking (engine fix)", () => {
++  const ep = clone(); const ch = ep.chars.find((c) => c.talk && c.talk.length);
++  if (!ch) return; // nothing to check in this episode
++  assert.equal(qc(ep).findings.some((f) => /blink during/.test(f.msg)), false);
++});
++console.log(`\n${n} tests passed${process.exitCode ? ", SOME FAILED" : ""}`);
+diff --git a/scripts/qc.mjs b/scripts/qc.mjs
+new file mode 100644
+index 0000000..bf6424b
+--- /dev/null
++++ b/scripts/qc.mjs
+@@ -0,0 +1,56 @@
++#!/usr/bin/env node
++// Pre-render quality control for a history episode. Pure data analysis: no GPU, no browser, no rendering.
++//   node scripts/qc.mjs                 -> QC the default episode, print the report
++//   node scripts/qc.mjs --strict        -> exit 1 on errors (use in CI / before rendering)
++//   node scripts/qc.mjs --warn-as-error -> exit 1 on warnings too
++//   node scripts/qc.mjs --json          -> also print the JSON report
++// Reports are written to out/qc/<episode>.json and out/qc/<episode>.txt
++import fs from "node:fs";
++import path from "node:path";
++import { pathToFileURL } from "node:url";
++import { build } from "esbuild";
++
++const args = process.argv.slice(2);
++const has = (f) => args.includes(f);
++const val = (f, d) => { const i = args.indexOf(f); return i >= 0 ? args[i + 1] : d; };
++const episodeKey = val("--episode", "pirates");
++const W = Number(val("--width", 720)), H = Number(val("--height", 1280));
++
++const registry = { pirates: { module: "src/history/episodes/pirates.ts", export: "pirates", audioDir: "public/audio/pirates" } };
++const reg = registry[episodeKey];
++if (!reg) { console.error(`Unknown episode "${episodeKey}". Known: ${Object.keys(registry).join(", ")}`); process.exit(2); }
++
++// bundle the TS (no tsx / ts-node dependency: esbuild already ships with Remotion)
++fs.mkdirSync("out/qc", { recursive: true });
++const entry = path.resolve("out/qc/.entry.ts");
++fs.writeFileSync(entry, `export { runQC, formatReport } from "../../src/history/qc/index";\nexport { ${reg.export} as episode } from "../../${reg.module.replace(/\.ts$/, "")}";\n`);
++const outfile = path.resolve("out/qc/.bundle.mjs");
++await build({ entryPoints: [entry], outfile, bundle: true, platform: "node", format: "esm", packages: "external", jsx: "automatic", logLevel: "error", loader: { ".json": "json" } });
++const { runQC, formatReport, episode } = await import(pathToFileURL(outfile).href + "?v=" + Date.now());
++
++// audio inputs, if the generator has run
++let durations = null;
++const manifest = path.join(reg.audioDir, "manifest.json");
++if (fs.existsSync(manifest)) durations = JSON.parse(fs.readFileSync(manifest, "utf8")).durations ?? null;
++let audioFiles = null;
++if (fs.existsSync(reg.audioDir)) audioFiles = new Set(fs.readdirSync(reg.audioDir));
++else if (fs.existsSync("scripts/generate-audio.mjs")) {
++  // not generated yet: derive the file list the generator WILL produce
++  const g = fs.readFileSync("scripts/generate-audio.mjs", "utf8");
++  const sfxBlock = g.slice(g.indexOf("const sfx = {"), g.indexOf("for (const [name, fn] of Object.entries(sfx))"));
++  audioFiles = new Set([...sfxBlock.matchAll(/^ {2}(\w+): /gm)].map((m) => m[1] + ".wav"));
++  audioFiles.add("music.wav"); audioFiles.add("ambience.wav");
++  for (const n of episode.narration) audioFiles.add(n.id + ".wav");
++}
++
++const t0 = Date.now();
++const report = runQC(episode, { aspect: W / H, durations, audioFiles });
++const text = formatReport(report);
++fs.writeFileSync(`out/qc/${episode.id}.json`, JSON.stringify(report, null, 1));
++fs.writeFileSync(`out/qc/${episode.id}.txt`, text + "\n");
++console.log(text);
++console.log(`\n(${((Date.now() - t0) / 1000).toFixed(1)}s, reports in out/qc/)`);
++if (has("--json")) console.log(JSON.stringify(report, null, 1));
++const errors = report.findings.filter((f) => f.severity === "error").length;
++const warns = report.findings.filter((f) => f.severity === "warn").length;
++if ((has("--strict") && errors) || (has("--warn-as-error") && (errors || warns))) process.exit(1);
+diff --git a/scripts/render-staged.mjs b/scripts/render-staged.mjs
+new file mode 100644
+index 0000000..5662893
+--- /dev/null
++++ b/scripts/render-staged.mjs
+@@ -0,0 +1,151 @@
++#!/usr/bin/env node
++// Staged, resumable renderer for history episodes.
++//   node scripts/render-staged.mjs                      -> QC gate, then render in 15 s chunks, stitch to out/history.mp4
++//   node scripts/render-staged.mjs --chunk-seconds 10   -> smaller stages (less memory, finer resume points)
++//   node scripts/render-staged.mjs --range 0-89         -> only render frames 0..89 (a quick smoke test)
++//   node scripts/render-staged.mjs --only 2             -> render just chunk #2 (0-based), no stitching
++//   node scripts/render-staged.mjs --concat-only        -> stitch chunks that are already cached
++//   node scripts/render-staged.mjs --ignore-qc          -> render even if the pre-render QC reports errors
++// Each chunk is cached under out/chunks/ keyed by a hash of the source, audio and settings, so a re-run after a
++// crash (or after changing only the last scene) re-renders only what changed. Needs Chromium + ffmpeg, no paid services.
++import fs from "node:fs";
++import os from "node:os";
++import path from "node:path";
++import crypto from "node:crypto";
++import { execFileSync, spawnSync } from "node:child_process";
++import { bundle } from "@remotion/bundler";
++import { renderMedia, selectComposition, openBrowser } from "@remotion/renderer";
++
++const args = process.argv.slice(2);
++const has = (f) => args.includes(f);
++const val = (f, d) => { const i = args.indexOf(f); return i >= 0 ? args[i + 1] : d; };
++const COMP = val("--comp", "History");
++const CHUNK_S = Number(val("--chunk-seconds", 15));
++const OUTFILE = val("--out", "out/history.mp4");
++const RETRIES = Number(val("--retries", 2));
++const GL = val("--gl", process.env.GL ?? "swangle");
++const CONC = Number(val("--concurrency", Math.max(1, Math.floor(os.cpus().length / 2))));
++const CHUNK_DIR = "out/chunks";
++fs.mkdirSync(CHUNK_DIR, { recursive: true });
++const log = (...a) => console.log(`[${new Date().toISOString().slice(11, 19)}]`, ...a);
++
++// ---------- stage 0: pre-render QC gate ----------
++if (!has("--skip-qc") && !has("--concat-only")) {
++  log("QC gate: node scripts/qc.mjs --strict");
++  const r = spawnSync("node", ["scripts/qc.mjs", "--strict"], { encoding: "utf8" });
++  const lines = (r.stdout ?? "").split("\n");
++  console.log(lines.filter((l) => /^QC report|ERROR|^check|^script|^camera|^lighting|^scene|^characters|^audio/.test(l)).join("\n"));
++  if (r.status !== 0) {
++    if (has("--ignore-qc")) log("QC reported errors, continuing because --ignore-qc was given.");
++    else { log("QC reported errors. Fix them (see out/qc/*.txt) or re-run with --ignore-qc. Nothing was rendered."); process.exit(3); }
++  }
++}
++
++// ---------- cache key ----------
++const walk = (d) => (fs.existsSync(d) ? fs.readdirSync(d, { withFileTypes: true }).flatMap((e) => (e.isDirectory() ? walk(path.join(d, e.name)) : [path.join(d, e.name)])) : []);
++const hashFiles = (files) => { const h = crypto.createHash("sha1"); for (const f of files.sort()) { h.update(f); h.update(fs.readFileSync(f)); } return h.digest("hex"); };
++const srcHash = hashFiles([...walk("src"), "package-lock.json", "remotion.config.ts"].filter((f) => fs.existsSync(f)));
++const audioHash = hashFiles(walk("public/audio"));
++const keyFor = (from, to) => crypto.createHash("sha1").update([srcHash, audioHash, COMP, from, to, GL].join("|")).digest("hex").slice(0, 10);
++
++// ---------- helpers ----------
++const probe = (file) => {
++  const j = JSON.parse(execFileSync("ffprobe", ["-v", "error", "-print_format", "json", "-show_format", "-show_streams", file], { encoding: "utf8" }));
++  const v = j.streams.find((s) => s.codec_type === "video"), a = j.streams.find((s) => s.codec_type === "audio");
++  return { dur: Number(j.format.duration), vdur: Number(v?.duration ?? j.format.duration), w: v?.width, h: v?.height, fps: v ? eval(v.r_frame_rate) : 0, audio: !!a };
++};
++// validity uses the VIDEO stream length: AAC padding makes the container longer than the video
++const chunkValid = (file, frames, fps) => { try { return fs.existsSync(file) && Math.abs(probe(file).vdur - frames / fps) < 0.05; } catch { return false; } };
++
++// ---------- bundle + composition ----------
++log("bundling…");
++const serveUrl = await bundle({ entryPoint: path.resolve("src/index.ts"), onProgress: () => {} });
++const chrome = [process.env.CHROME_PATH, "/opt/pw-browsers/chromium-1243/chrome-linux64/chrome"].find((p) => p && fs.existsSync(p));
++const launch = () => openBrowser("chrome", { browserExecutable: chrome ?? undefined, chromiumOptions: { gl: GL } });
++let browser = await launch();
++const comp = await selectComposition({ serveUrl, id: COMP, inputProps: {}, puppeteerInstance: browser });
++const { fps, width, height } = comp;
++const [r0, r1] = val("--range", null) ? val("--range").split("-").map(Number) : [0, comp.durationInFrames - 1];
++const step = Math.round(CHUNK_S * fps);
++const chunks = [];
++for (let a = r0; a <= r1; a += step) chunks.push({ i: chunks.length, from: a, to: Math.min(r1, a + step - 1) });
++log(`${COMP}: ${width}x${height} @ ${fps}fps, frames ${r0}-${r1}, ${chunks.length} chunk(s) of <= ${CHUNK_S}s, concurrency ${CONC}, gl ${GL}`);
++
++// ---------- stage 1..n: render chunks ----------
++const done = [], failed = [];
++const wanted = has("--only") ? chunks.filter((c) => c.i === Number(val("--only"))) : chunks;
++for (const ch of chunks) {
++  ch.file = path.join(CHUNK_DIR, `${COMP}_${String(ch.from).padStart(5, "0")}-${String(ch.to).padStart(5, "0")}_${keyFor(ch.from, ch.to)}.mp4`);
++  const frames = ch.to - ch.from + 1;
++  if (has("--concat-only") || !wanted.includes(ch)) { if (chunkValid(ch.file, frames, fps)) done.push(ch); continue; }
++  if (!has("--force") && chunkValid(ch.file, frames, fps)) { log(`chunk ${ch.i + 1}/${chunks.length} (${ch.from}-${ch.to}): cached, skipping`); done.push(ch); continue; }
++  let ok = false;
++  for (let attempt = 0; attempt <= RETRIES && !ok; attempt++) {
++    const t0 = Date.now();
++    try {
++      log(`chunk ${ch.i + 1}/${chunks.length} (${ch.from}-${ch.to}) attempt ${attempt + 1}`);
++      const tmp = ch.file + ".part.mp4";
++      let lastPct = -1;
++      await renderMedia({
++        composition: comp, serveUrl, codec: "h264", audioCodec: "aac", forSeamlessAacConcatenation: true,
++        outputLocation: tmp, overwrite: true, frameRange: [ch.from, ch.to], inputProps: {}, concurrency: CONC,
++        imageFormat: "jpeg", puppeteerInstance: browser, browserExecutable: chrome ?? undefined, chromiumOptions: { gl: GL }, timeoutInMilliseconds: 180000,
++        onProgress: ({ progress }) => { const p = Math.floor(progress * 10) * 10; if (p !== lastPct) { lastPct = p; log(`  ${p}%`); } },
++      });
++      fs.renameSync(tmp, ch.file);
++      if (!chunkValid(ch.file, frames, fps)) throw new Error("chunk failed validation (wrong duration)");
++      log(`  chunk ${ch.i + 1} done in ${((Date.now() - t0) / 1000).toFixed(0)}s (${(fs.statSync(ch.file).size / 1e6).toFixed(1)} MB)`);
++      ok = true;
++    } catch (e) {
++      log(`  chunk ${ch.i + 1} failed: ${String(e.message).split("\n")[0]}`);
++      try { await browser.close(() => {}, true); } catch { /* browser may already be gone */ }
++      browser = await launch(); // recover from a crashed / out-of-memory browser
++      if (attempt < RETRIES) await new Promise((r) => setTimeout(r, 3000 * (attempt + 1)));
++    }
++  }
++  (ok ? done : failed).push(ch);
++}
++try { await browser.close(() => {}, true); } catch { /* ignore */ }
++if (failed.length) { log(`FAILED chunks: ${failed.map((c) => `#${c.i} (${c.from}-${c.to})`).join(", ")}. Completed chunks stay cached; re-run the same command to resume.`); process.exit(1); }
++if (has("--only")) { log("--only given: skipping stitch."); process.exit(0); }
++
++// ---------- final stage: stitch + verify ----------
++// Plain `-c copy` of per-chunk MP4s leaves padded audio and shifted video timestamps at each seam (variable frame
++// rate, drift). So: video goes through MPEG-TS (clean timestamps), audio is decoded to exact-length PCM per chunk,
++// joined, and encoded to AAC once. Net result: no seam artefacts, no re-encode of the video.
++const ordered = chunks.filter((c) => done.includes(c));
++if (ordered.length !== chunks.length) { log(`Cannot stitch: ${chunks.length - ordered.length} chunk(s) missing. Run without --concat-only.`); process.exit(1); }
++const ff = (...a) => execFileSync("ffmpeg", ["-y", "-v", "error", ...a]);
++const TMP = path.join(CHUNK_DIR, "stitch");
++fs.rmSync(TMP, { recursive: true, force: true });
++fs.mkdirSync(TMP, { recursive: true });
++const vlist = [], alist = [];
++for (const c of ordered) {
++  const base = path.join(TMP, String(c.i).padStart(3, "0"));
++  const frames = c.to - c.from + 1;
++  ff("-i", c.file, "-an", "-c:v", "copy", "-bsf:v", "h264_mp4toannexb", "-f", "mpegts", base + ".ts");
++  vlist.push(`file '${path.resolve(base)}.ts'`);
++  if (probe(c.file).audio) {
++    ff("-i", c.file, "-vn", "-ar", "48000", "-ac", "2", "-t", (frames / fps).toFixed(6), "-c:a", "pcm_s16le", base + ".wav");
++    alist.push(`file '${path.resolve(base)}.wav'`);
++  }
++}
++fs.writeFileSync(path.join(TMP, "v.txt"), vlist.join("\n") + "\n");
++fs.writeFileSync(path.join(TMP, "a.txt"), alist.join("\n") + "\n");
++ff("-f", "concat", "-safe", "0", "-i", path.join(TMP, "v.txt"), "-c", "copy", "-bsf:a", "aac_adtstoasc", path.join(TMP, "video.mp4"));
++fs.mkdirSync(path.dirname(OUTFILE), { recursive: true });
++if (alist.length === ordered.length) {
++  ff("-f", "concat", "-safe", "0", "-i", path.join(TMP, "a.txt"), "-c", "copy", path.join(TMP, "audio.wav"));
++  ff("-i", path.join(TMP, "video.mp4"), "-i", path.join(TMP, "audio.wav"), "-map", "0:v:0", "-map", "1:a:0", "-c:v", "copy", "-c:a", "aac", "-b:a", "192k", "-shortest", "-movflags", "+faststart", OUTFILE);
++} else ff("-i", path.join(TMP, "video.mp4"), "-c", "copy", "-movflags", "+faststart", OUTFILE);
++fs.rmSync(TMP, { recursive: true, force: true }); // temp stitch files (also keeps tsc from scanning .ts transport streams)
++const total = r1 - r0 + 1;
++const info = probe(OUTFILE);
++const problems = [];
++if (info.w !== width || info.h !== height) problems.push(`size ${info.w}x${info.h}, expected ${width}x${height}`);
++if (Math.abs(info.fps - fps) > 0.01) problems.push(`fps ${info.fps}, expected ${fps}`);
++if (Math.abs(info.dur - total / fps) > 0.06) problems.push(`duration ${info.dur.toFixed(3)}s, expected ${(total / fps).toFixed(3)}s`);
++if (fs.existsSync("public/audio/pirates/manifest.json") && !info.audio) problems.push("audio track missing although audio files exist");
++fs.writeFileSync("out/render-manifest.json", JSON.stringify({ comp: COMP, frames: [r0, r1], fps, chunks: ordered.map((c) => ({ ...c })), output: OUTFILE, probe: info, problems, srcHash, audioHash }, null, 1));
++if (problems.length) { log("VERIFY FAILED: " + problems.join("; ")); process.exit(1); }
++log(`OK -> ${OUTFILE}  ${info.w}x${info.h} ${info.fps}fps ${info.dur.toFixed(2)}s audio=${info.audio}`);
+diff --git a/src/history/Episode.tsx b/src/history/Episode.tsx
+index 9bfb7f1..8f66ca7 100644
+--- a/src/history/Episode.tsx
++++ b/src/history/Episode.tsx
+@@ -43,7 +43,7 @@ const lightning = (ep: Ep, t: number) => {
+   return Math.min(1.2, f);
+ };
+ 
+-export const EpisodeView: React.FC<{ episode: Ep; durations: Record<string, number> | null; audio: boolean }> = ({ episode: ep, durations, audio }) => {
++export const EpisodeView: React.FC<{ episode: Ep; durations: Record<string, number> | null; audio: boolean; plain?: boolean }> = ({ episode: ep, durations, audio, plain }) => {
+   const frame = useCurrentFrame();
+   const { fps, width, height } = useVideoConfig();
+   const t = frame / fps;
+@@ -92,11 +92,15 @@ export const EpisodeView: React.FC<{ episode: Ep; durations: Record<string, numb
+           <Wipes list={ep.transitions} t={t} cam={cam} atmo={atmo} />
+         </ThreeCanvas>
+       </div>
+-      <Vignette />
+-      <TitleCard t={t} />
+-      <Callouts t={t} list={ep.callouts} />
+-      <Subtitles t={t} lines={ep.narration} durations={durations} />
+-      <div style={{ position: "absolute", inset: 0, background: "#000", opacity: Math.max(fadeOut, fadeIn), pointerEvents: "none" }} />
++      {!plain && (
++        <>
++          <Vignette />
++          <TitleCard t={t} />
++          <Callouts t={t} list={ep.callouts} />
++          <Subtitles t={t} lines={ep.narration} durations={durations} />
++          <div style={{ position: "absolute", inset: 0, background: "#000", opacity: Math.max(fadeOut, fadeIn), pointerEvents: "none" }} />
++        </>
++      )}
+       {audio && durations && <AudioLayer ep={ep} durations={durations} />}
+     </AbsoluteFill>
+   );
+diff --git a/src/history/HistoryVideo.tsx b/src/history/HistoryVideo.tsx
+index 19eecd9..4d99d44 100644
+--- a/src/history/HistoryVideo.tsx
++++ b/src/history/HistoryVideo.tsx
+@@ -2,5 +2,6 @@ import React from "react";
+ import { EpisodeView } from "./Episode";
+ import { pirates } from "./episodes/pirates";
+ 
+-export type HistoryProps = { durations: Record<string, number> | null; audio: boolean };
+-export const HistoryVideo: React.FC<HistoryProps> = ({ durations, audio }) => <EpisodeView episode={pirates} durations={durations} audio={audio} />;
++/** plain = render the 3D world only (no title / subtitles / callouts / fades); used by the pixel QC */
++export type HistoryProps = { durations: Record<string, number> | null; audio: boolean; plain?: boolean };
++export const HistoryVideo: React.FC<HistoryProps> = ({ durations, audio, plain }) => <EpisodeView episode={pirates} durations={durations} audio={audio} plain={plain} />;
+diff --git a/src/history/characters/pose.ts b/src/history/characters/pose.ts
+index 3a4209f..ecf9921 100644
+--- a/src/history/characters/pose.ts
++++ b/src/history/characters/pose.ts
+@@ -15,7 +15,7 @@ export const EXPR: Record<Expr, Partial<Pose>> = {
+   shock: { brow: 1.1, eyeWide: 1.3, mouth: 0.85 }, smug: { smile: 0.7, brow: -0.3, eyeWide: -0.5 }, shout: { mouth: 1, brow: -0.7, smile: 0.2 },
+   confused: { brow: 0.6, browTilt: 1, smile: -0.3, mouth: 0.1 }, curious: { brow: 0.7, smile: 0.3, eyeWide: 0.4 },
+ };
+-const DEFAULT_EXPR: Partial<Record<ActionName, Expr>> = {
++export const DEFAULT_EXPR: Partial<Record<ActionName, Expr>> = {
+   panic: "scared", cower: "scared", surrender: "shock", shout: "shout", menace: "angry", slash: "angry", haul: "angry",
+   laugh: "grin", cheer: "grin", wave: "grin", leap: "shout", fire: "smug", point: "smug", aim: "angry", brace: "scared",
+   dance1: "happy", dance2: "grin", dance3: "happy", confused: "confused", watch: "curious", argue: "angry", play: "happy",
+@@ -85,5 +85,7 @@ export const poseAt = (actions: CharAction[], talk: [number, number][] | undefin
+   if (speaking) pose.mouth = Math.max(pose.mouth, 0.2 + 0.7 * Math.abs(Math.sin(t * 17 + seed)) * (0.6 + 0.4 * Math.sin(t * 5.3)));
+   pose.lean += sway * 0.7;
+   const ph = (t * 0.9 + hash(seed) * 3) % 3.3;
+-  return { pose, blink: ph < 0.13 ? 1 : 0 };
++  // nobody blinks while talking (reference rule): hold the eyes open through speech plus a short margin
++  const holdOpen = (talk ?? []).some(([a, b]) => t >= a - 0.15 && t <= b + 0.15);
++  return { pose, blink: !holdOpen && ph < 0.13 ? 1 : 0 };
+ };
+diff --git a/src/history/episodes/pirates.ts b/src/history/episodes/pirates.ts
+index a65d5cc..c780286 100644
+--- a/src/history/episodes/pirates.ts
++++ b/src/history/episodes/pirates.ts
+@@ -103,8 +103,8 @@ const C = (t: number, id: string, off: Vec3, lookOff: Vec3, fov: number, o: Part
+ const cameras: CamKey[] = [
+   // S1 hook: low wide -> rise & follow the sloop
+   K(0, [0, 0.9, 0], [1, 3.2, 60], 64, { shake: 0.8 }),
+-  K(2.6, [-1, 1.7, 1.5], [0.5, 5.2, 36], 54, { shake: 0.6 }),
+-  K(4.5, [-2.2, 2.5, 3], [2, 5, 18], 48, { shake: 0.9 }),
++  K(2.6, [-1, 3.4, 1.5], [0.5, 5.2, 36], 54, { shake: 0.6 }),
++  K(4.5, [-2.2, 3.8, 3], [2, 5, 18], 48, { shake: 0.9 }),
+   K(5.8, [-3, 3.1, 4], [2.5, 4.5, 3], 44, { shake: 1.0, ease: "snap", whip: 0.9 }),
+   // S2 sloop design: full ship -> mast -> sail -> waterline -> wide cove
+   O(6.8, "sB", 2.2, 0.12, 31, [0, 5.5, 0], 55, { shake: 0.5 }),
+@@ -115,7 +115,7 @@ const cameras: CamKey[] = [
+   O(13.0, "sB", 0.8, 0.32, 54, [-7, 3, 7], 58, { ease: "snap", whip: -0.8 }),
+   // S3a careening on the beach
+   K(13.7, [790, 3.4, -15], [770, 2.4, -1], 56, { shake: 0.3 }),
+-  K(15.2, [782, 2.4, -8], [772.5, 2.4, -1.5], 48, { shake: 0.3 }),
++  K(15.2, [782, 3.9, -8], [772.5, 2.4, -1.5], 48, { shake: 0.3 }),
+   K(16.0, [777, 2.0, -6], [773.6, 2.0, -3], 40, { ease: "snap", whip: 0.7 }),
+   // S3b chase
+   O(16.7, "sD", 1.25, 0.1, 24, [0, 4, 2], 58, { shake: 0.6 }),
+@@ -193,7 +193,7 @@ const sfx: SfxCue[] = [
+   { t: 33.65, file: "whoosh2.wav", vol: 0.9 },
+   { t: 36.0, file: "hook.wav", vol: 0.8 }, { t: 36.18, file: "hook.wav", vol: 0.8 }, { t: 36.36, file: "hook.wav", vol: 0.8 },
+   { t: 36.9, file: "thud.wav", vol: 0.9 }, { t: 38.3, file: "thud.wav", vol: 0.8 }, { t: 38.8, file: "thud.wav", vol: 0.7 }, { t: 39.2, file: "gasp.wav", vol: 0.6 },
+-  { t: 40.75, file: "whoosh.wav", vol: 0.9 },
++  { t: 40.75, file: "whoosh.wav", vol: 0.9 }, { t: 31.2, file: "whoosh2.wav", vol: 0.8 },
+   { t: 42.5, file: "creak.wav", vol: 0.6 }, { t: 45.8, file: "thud.wav", vol: 0.8 }, { t: 46.4, file: "thud.wav", vol: 0.8 }, { t: 47.0, file: "thud.wav", vol: 0.8 }, { t: 47.6, file: "thud.wav", vol: 0.8 },
+   { t: 49.9, file: "hiss.wav", vol: 0.7 }, { t: 52.0, file: "musket.wav", vol: 0.5 }, { t: 53.4, file: "whoosh2.wav", vol: 0.6 }, { t: 53.8, file: "flap.wav", vol: 0.6 },
+   { t: 55.2, file: "whoosh.wav", vol: 0.7 }, { t: 57.0, file: "gull.wav", vol: 0.5 }, { t: 58.4, file: "gull.wav", vol: 0.4 },
+@@ -205,6 +205,20 @@ export const pirates: Episode = {
+   title: "What Made Pirate Ships So Dangerous?",
+   fps: 30,
+   durationSec: 60,
++  story: {
++    logline: "How a handful of pirates captured giant merchant ships: speed, fear and firepower, ending with Blackbeard's smoking-fuse bluff.",
++    setting: { place: "Caribbean, Golden Age of Piracy", year: 1717 },
++    protagonist: "bb",
++    supporting: ["helm1", "mcap"],
++    beats: [
++      { t: 0.35, kind: "hook", note: "How could a handful of pirates capture giant merchant ships?" },
++      { t: 6.6, kind: "setting", note: "The sloop: one mast, shallow hull, hidden coves" },
++      { t: 20.5, kind: "conflict", note: "Broadside, muskets and cutlasses" },
++      { t: 27.4, kind: "escalation", note: "Black flag = mercy, red flag = no quarter" },
++      { t: 49.5, kind: "twist", note: "Blackbeard's smoking fuses make crews surrender without a fight" },
++      { t: 55.5, kind: "resolution", note: "Fear, speed and firepower" },
++    ],
++  },
+   ships, chars,
+   islands: [
+     { id: "isl2", at: [358, 16], radius: 32, peak: 9, seed: 3, palms: 16, rot: 0.4 },
+@@ -242,8 +256,10 @@ export const pirates: Episode = {
+     { t: 16.35, dur: 0.8, kind: "spray", dir: 1 },
+     { t: 20.2, dur: 0.9, kind: "hull", dir: -1 },
+     { t: 27.2, dur: 1.0, kind: "smoke", dir: 1 },
++    { t: 31.6, dur: 0.8, kind: "spray", dir: -1 }, // hides the jump from the captain close-up to the ship
+     { t: 34.2, dur: 0.9, kind: "sail", dir: -1 },
+     { t: 41.2, dur: 1.0, kind: "hull", dir: 1 },
++    { t: 53.2, dur: 0.9, kind: "smoke", dir: 1 }, // the fuse smoke carries the whip-pan to the surrendering ship
+   ],
+   shakes: [
+     ...gunPorts.map((_, i) => ({ t: 22.3 + i * 0.14, amp: 3, dur: 0.35 })),
+diff --git a/src/history/qc/audio.ts b/src/history/qc/audio.ts
+new file mode 100644
+index 0000000..af56c3e
+--- /dev/null
++++ b/src/history/qc/audio.ts
+@@ -0,0 +1,53 @@
++import { fmt, type Ctx } from "./util";
++
++const SFX_FOR: Record<string, string[]> = {
++  cannon: ["cannon.wav"], muzzle: ["musket.wav", "cannon.wav"], splash: ["splash.wav"],
++  lightning: ["thunder.wav"], grapple: ["hook.wav"], debris: ["crack.wav", "thud.wav"],
++};
++
++export const checkAudio = (c: Ctx, durations: Record<string, number> | null | undefined, files: Set<string> | null | undefined) => {
++  const { ep } = c;
++  const K = "audio";
++
++  // narration length vs. its slot (subtitle windows and ducking depend on it)
++  if (!durations) c.add(K, "info", "Narration audio has not been generated (no manifest.json), so spoken length vs. slot could not be verified. Run `node scripts/generate-audio.mjs`.");
++  else {
++    ep.narration.forEach((n, i) => {
++      const d = durations[n.id];
++      if (d === undefined) return c.add(K, "error", `No generated audio duration for ${n.id}.`, n.start);
++      const slot = n.end - n.start;
++      const next = ep.narration[i + 1];
++      if (next && n.start + d > next.start - 0.05) c.add(K, "error", `${n.id} audio (${d.toFixed(2)}s) runs into ${next.id}.`, n.start);
++      else if (d > slot + 0.4) c.add(K, "warn", `${n.id} audio is ${d.toFixed(2)}s but its slot is ${slot.toFixed(2)}s; subtitles will lag the voice.`, n.start);
++      if (n.start + d > ep.durationSec - 0.3) c.add(K, "error", `${n.id} audio runs past the end fade.`, n.start);
++    });
++  }
++
++  // every sound-making event needs a cue near it
++  for (const e of ep.fx) {
++    const want = SFX_FOR[e.kind];
++    if (!want) continue;
++    const ok = ep.sfx.some((s) => want.includes(s.file) && Math.abs(s.t - e.t) <= 0.4);
++    if (!ok) c.add(K, "warn", `${e.kind} event at ${fmt(e.t)} has no matching sound cue within 0.4s (${want.join(" / ")}).`, e.t);
++  }
++  // scene changes should be carried by a whoosh
++  for (const tr of ep.transitions) {
++    const ok = ep.sfx.some((s) => s.file.startsWith("whoosh") && Math.abs(s.t - (tr.t - tr.dur * 0.1)) <= 0.9);
++    if (!ok) c.add(K, "warn", `Transition at ${fmt(tr.t)} has no whoosh cue.`, tr.t);
++  }
++  // cue files must exist
++  if (files) {
++    const used = new Set([ep.music.file, ep.ambience.file, ...ep.sfx.map((s) => s.file), ...ep.narration.map((n) => n.id + ".wav")]);
++    for (const f of used) if (!files.has(f)) c.add(K, "error", `Audio file "${f}" is referenced but is not produced by the audio generator.`);
++  } else c.add(K, "info", "Audio file list unknown; skipped file-existence check.");
++
++  const cues = [...ep.sfx].sort((a, b) => a.t - b.t);
++  let stack = 0;
++  for (let i = 0; i < cues.length; i++) {
++    let n = 0;
++    for (let j = i; j < cues.length && cues[j].t - cues[i].t < 0.1; j++) n++;
++    stack = Math.max(stack, n);
++  }
++  if (stack > 3) c.add(K, "warn", `Up to ${stack} sound cues fire within 100ms of each other; the mix will clip or smear.`);
++  c.metrics.sfxCues = ep.sfx.length;
++};
+diff --git a/src/history/qc/camera.ts b/src/history/qc/camera.ts
+new file mode 100644
+index 0000000..4a28558
+--- /dev/null
++++ b/src/history/qc/camera.ts
+@@ -0,0 +1,152 @@
++import { waveHeight } from "../world/waves";
++import { hgt } from "../world/Island";
++import { len3, norm3, sub3 } from "../engine/math";
++import type { Shot } from "./types";
++import { charHeight, fmt, inFrame, median, project, runs, type Ctx } from "./util";
++
++/** Largest character-height fraction of the frame among characters in view at frame i. */
++export const faceFraction = (c: Ctx, i: number) => {
++  const f = c.frames[i];
++  let best = 0;
++  for (const ch of c.ep.chars) {
++    const p = c.R.charWorld(ch, f.t);
++    const H = charHeight(ch.scale);
++    const pr = project(f.cam, [p[0], p[1] + H * 0.5, p[2]], c.aspect);
++    if (!pr || pr.z > 120 || !inFrame(pr, 0.05)) continue;
++    best = Math.max(best, H / (2 * pr.z * pr.th));
++  }
++  return best;
++};
++
++export const checkCamera = (c: Ctx): Shot[] => {
++  const { ep, frames, th } = c;
++  const K = "camera";
++  const fps = ep.fps;
++
++  // ---- keyframe structure ----
++  const ks = ep.cameras;
++  if (ks.length < 2) { c.add(K, "error", "Fewer than 2 camera keys."); return []; }
++  for (let i = 1; i < ks.length; i++) if (ks[i].t <= ks[i - 1].t) c.add(K, "error", `Camera keys are not strictly increasing at ${fmt(ks[i].t)}.`, ks[i].t);
++  if (ks[0].t > 0.01) c.add(K, "error", `First camera key is at ${fmt(ks[0].t)}, not 0.`);
++  if (ks[ks.length - 1].t < ep.durationSec - 0.01) c.add(K, "error", `Last camera key (${fmt(ks[ks.length - 1].t)}) is before the end of the film.`);
++  for (const k of ks) {
++    if (k.fov < 15 || k.fov > 100) c.add(K, "warn", `FOV ${k.fov}° at ${fmt(k.t)} is outside the natural 15-100° lens range${k.fov > 100 ? " (fisheye distortion)" : ""}.`, k.t);
++  }
++
++  // ---- per-frame motion: scene jumps, zoom smoothness, framing safety ----
++  const jumpFlag: boolean[] = [];
++  const jumpMag: { m: number; deg: number }[] = [];
++  const fovFlag: boolean[] = [];
++  for (let i = 0; i < frames.length; i++) {
++    if (i === 0) { jumpFlag.push(false); jumpMag.push({ m: 0, deg: 0 }); fovFlag.push(false); continue; }
++    const a = frames[i - 1].cam, b = frames[i].cam;
++    const speed = len3(sub3(b.pos, a.pos)) * fps;
++    const fa = norm3(sub3(a.look, a.pos)), fb = norm3(sub3(b.look, b.pos));
++    const deg = (Math.acos(Math.max(-1, Math.min(1, fa[0] * fb[0] + fa[1] * fb[1] + fa[2] * fb[2]))) * 180) / Math.PI;
++    jumpFlag.push(speed > th.jumpSpeed || deg > th.jumpAngle);
++    jumpMag.push({ m: speed / fps, deg });
++    fovFlag.push(Math.abs(b.fov - a.fov) * fps > th.fovRateMax);
++  }
++
++  // group jump frames into events (merge frames < 0.4s apart)
++  const events: { t0: number; t1: number; m: number; deg: number }[] = [];
++  for (const [s, e] of runs(jumpFlag)) {
++    const last = events[events.length - 1];
++    const ev = { t0: frames[s].t, t1: frames[e].t, m: Math.max(...jumpMag.slice(s, e + 1).map((x) => x.m)), deg: Math.max(...jumpMag.slice(s, e + 1).map((x) => x.deg)) };
++    if (last && ev.t0 - last.t1 < 0.4) { last.t1 = ev.t1; last.m = Math.max(last.m, ev.m); last.deg = Math.max(last.deg, ev.deg); } else events.push(ev);
++  }
++
++  let masked = 0, hard = 0;
++  const exits: ("masked" | "hard")[] = [];
++  for (const ev of events) {
++    const cover = ep.transitions.find((tr) => ev.t1 >= tr.t - tr.dur / 2 - th.maskPad && ev.t0 <= tr.t + tr.dur / 2 + th.maskPad);
++    if (cover) { masked++; exits.push("masked"); }
++    else {
++      const hFov = 2 * Math.atan(Math.tan((frames[Math.round(ev.t0 * fps)].cam.fov * Math.PI) / 360) * c.aspect) * (180 / Math.PI);
++      const widths = ev.deg / hFov;
++      const what = `in one frame the camera moves ${ev.m.toFixed(1)} m and turns ${ev.deg.toFixed(0)}° (${widths.toFixed(1)} frame widths) with no transition covering it`;
++      if (widths >= th.hardCutWidths || ev.m > 20) {
++        hard++; exits.push("hard");
++        c.add(K, "error", `Hard cut at ${fmt(ev.t0)}: ${what}. Slow the move, extend the segment, or add an object wipe.`, ev.t0);
++      } else {
++        masked++; exits.push("masked");
++        c.add(K, "warn", `Violent whip-pan at ${fmt(ev.t0)}: ${what}. The content smears and reads close to a cut; lengthen the move.`, ev.t0);
++      }
++    }
++  }
++  for (const [s, e] of runs(fovFlag)) {
++    const t = frames[s].t;
++    if (events.some((ev) => t >= ev.t0 - 0.3 && t <= ev.t1 + 0.3)) continue;
++    c.add(K, "warn", `Zoom at ${fmt(t)}-${fmt(frames[e].t)} changes faster than ${th.fovRateMax}°/s; it will look like a pop, not a smooth zoom.`, t);
++  }
++
++  // ---- shots ----
++  const bounds = [0, ...events.map((e) => (e.t0 + e.t1) / 2), ep.durationSec];
++  const shots: Shot[] = [];
++  for (let i = 0; i < bounds.length - 1; i++) {
++    const i0 = Math.round(bounds[i] * fps), i1 = Math.min(frames.length - 1, Math.round(bounds[i + 1] * fps) - 1);
++    const fr: number[] = [];
++    for (let j = i0; j <= i1; j += 3) fr.push(faceFraction(c, j));
++    fr.sort((a, b) => a - b);
++    const p75 = fr.length ? fr[Math.floor(fr.length * 0.75)] : 0;
++    const midCam = frames[Math.min(frames.length - 1, Math.round((i0 + i1) / 2))].cam;
++    const dist = len3(sub3(midCam.look, midCam.pos));
++    const type: Shot["type"] = p75 >= 0.45 ? "close-up" : p75 >= 0.15 ? "medium" : dist < 22 ? "detail" : "wide";
++    shots.push({ start: bounds[i], end: bounds[i + 1], type, exit: i < events.length ? exits[i] : "end" });
++  }
++  const lens = shots.map((s) => s.end - s.start);
++  c.metrics.shots = shots.length;
++  c.metrics.medianShotSec = +median(lens).toFixed(1);
++  c.metrics.sceneJumps = events.length;
++  c.metrics.hardCuts = hard;
++  c.metrics.maskedJumps = masked;
++  const rate = (events.length / ep.durationSec) * 10;
++  c.metrics.cutsPer10s = +rate.toFixed(2);
++  for (const t of ["wide", "medium", "close-up", "detail"] as const) c.metrics["shots_" + t] = shots.filter((s) => s.type === t).length;
++  if (rate > th.cutsPer10Warn) c.add(K, "warn", `${rate.toFixed(1)} scene changes per 10s (limit ${th.cutsPer10Warn}); the reference films average 0.4 with ~13s shots. Merge scenes or link them with continuous camera moves.`);
++  for (const t of ["wide", "medium", "close-up"] as const) if (!shots.some((s) => s.type === t)) c.add(K, "warn", `No ${t} shot in the whole film; shot variety is missing.`);
++
++  // ---- movement vocabulary (info) ----
++  const tracking = ks.filter((k) => k.target && k.rel).length;
++  const whips = ks.filter((k) => k.whip).length;
++  let zooms = 0;
++  for (let i = 1; i < ks.length; i++) if (Math.abs(ks[i].fov - ks[i - 1].fov) >= 8) zooms++;
++  c.metrics.cam_tracking = tracking; c.metrics.cam_whipPans = whips; c.metrics.cam_zooms = zooms;
++  if (!tracking) c.add(K, "warn", "No tracking (entity-relative) camera keys; the camera never follows a subject.");
++
++  // ---- first face on screen ----
++  let firstFace = -1;
++  for (let i = 0; i < frames.length; i += 2) if (faceFraction(c, i) >= th.faceFrac) { firstFace = frames[i].t; break; }
++  c.metrics.firstFaceSec = firstFace < 0 ? "never" : +firstFace.toFixed(1);
++  if (firstFace < 0) c.add(K, "error", "No character face is ever on screen.");
++  else if (firstFace > th.firstFaceError) c.add(K, "error", `First character face appears at ${fmt(firstFace)}; viewers need a face within ${th.firstFaceWarn}s.`, firstFace);
++  else if (firstFace > th.firstFaceWarn) c.add(K, "warn", `First character face appears at ${fmt(firstFace)} (aim for under ${th.firstFaceWarn}s).`, firstFace);
++
++  // ---- camera safety: clipping, underwater, inside terrain ----
++  // frames fully covered by a wipe hide any camera hazard
++  const covered = frames.map((f) => ep.transitions.some((tr) => Math.abs(f.t - tr.t) <= tr.dur / 2));
++  const hit = { water: [] as boolean[], skim: [] as boolean[], island: [] as boolean[], terrainSkim: [] as boolean[], clip: [] as boolean[] };
++  for (const f of frames) {
++    const [x, y, z] = f.cam.pos;
++    const w = waveHeight(x, z, f.t, c.R.stormAt(f.t));
++    const cv = covered[f.i];
++    hit.water.push(!cv && y < w - 0.05);
++    hit.skim.push(!cv && y >= w - 0.05 && y < w + 0.15);
++    let inside = false, skim = false;
++    for (const s of ep.islands) {
++      const dx = x - s.at[0], dz = z - s.at[1];
++      if (Math.hypot(dx, dz) >= s.radius) continue;
++      const h = hgt(s, dx, dz);
++      if (y < h - 0.05) inside = true; else if (y < h + 0.3) skim = true;
++    }
++    hit.island.push(!cv && inside); hit.terrainSkim.push(!cv && skim && !inside);
++    hit.clip.push(!cv && ep.chars.some((ch) => { const p = c.R.charWorld(ch, f.t); return Math.hypot(p[0] - x, p[2] - z) < th.camClear && y > p[1] && y < p[1] + charHeight(ch.scale); }));
++  }
++  for (const [s, e] of runs(hit.water)) c.add(K, e - s + 1 >= 6 ? "error" : "warn", `Camera is below the water surface at ${fmt(frames[s].t)} for ${((e - s + 1) / fps).toFixed(2)}s${e - s + 1 >= 6 ? "" : " (brief flicker)"}.`, frames[s].t);
++  for (const [s, e] of runs(hit.island)) c.add(K, e - s + 1 >= 6 ? "error" : "warn", `Camera is inside island terrain at ${fmt(frames[s].t)} for ${((e - s + 1) / fps).toFixed(2)}s; the frame will be a blank wash.`, frames[s].t);
++  for (const [s] of runs(hit.skim)) c.add(K, "warn", `Camera skims the water surface at ${fmt(frames[s].t)} (< 0.15 m above a wave crest); it may clip into the swell.`, frames[s].t);
++  for (const [s] of runs(hit.terrainSkim)) c.add(K, "warn", `Camera skims island terrain at ${fmt(frames[s].t)} (< 0.3 m clearance).`, frames[s].t);
++  for (const [s] of runs(hit.clip)) c.add(K, "warn", `Camera passes within ${th.camClear} m of a character at ${fmt(frames[s].t)} (the billboard will fill or clip the frame).`, frames[s].t);
++
++  return shots;
++};
+diff --git a/src/history/qc/characters.ts b/src/history/qc/characters.ts
+new file mode 100644
+index 0000000..6109873
+--- /dev/null
++++ b/src/history/qc/characters.ts
+@@ -0,0 +1,74 @@
++import { DEFAULT_EXPR, poseAt, type Pose } from "../characters/pose";
++import { charHeight, fmt, inFrame, project, type Ctx } from "./util";
++
++const HEX = /^#[0-9a-fA-F]{6}$/;
++
++export const checkCharacters = (c: Ctx) => {
++  const { ep } = c;
++  const K = "characters";
++
++  // ---------- consistency of the look (single source of truth per id) ----------
++  for (const ch of ep.chars) {
++    const L = ch.look;
++    for (const f of ["skin", "coat", "shirt", "pants", "hatColor", "hair"] as const) if (!HEX.test(L[f])) c.add(K, "error", `"${ch.id}": look.${f} "${L[f]}" is not a #rrggbb colour.`);
++    for (const f of ["sash", "apron"] as const) { const v = L[f]; if (v && !HEX.test(v)) c.add(K, "error", `"${ch.id}": look.${f} "${v}" is not a #rrggbb colour.`); }
++    if (L.build < 0.85 || L.build > 1.3) c.add(K, "warn", `"${ch.id}": build ${L.build} is outside the shared proportion range 0.85-1.3.`);
++    if (ch.scale < 0.5 || ch.scale > 1.3) c.add(K, "warn", `"${ch.id}": scale ${ch.scale} is outside the shared range 0.5-1.3.`);
++  }
++  const named = [ep.story?.protagonist, ...(ep.story?.supporting ?? [])].filter((x): x is string => !!x);
++  for (let a = 0; a < named.length; a++) for (let b = a + 1; b < named.length; b++) {
++    const A = ep.chars.find((x) => x.id === named[a]), B = ep.chars.find((x) => x.id === named[b]);
++    if (A && B && A.look.coat === B.look.coat && A.look.hat === B.look.hat && A.look.hatColor === B.look.hatColor) c.add(K, "warn", `Named characters "${A.id}" and "${B.id}" look identical; viewers cannot tell them apart.`);
++  }
++
++  // ---------- action timelines ----------
++  for (const ch of ep.chars) {
++    if (!ch.actions.length) { c.add(K, "info", `"${ch.id}" has no actions (stands idle all film).`); continue; }
++    for (let i = 1; i < ch.actions.length; i++) {
++      const d = ch.actions[i].t - ch.actions[i - 1].t;
++      if (d < 0) c.add(K, "error", `"${ch.id}": actions are out of order at ${fmt(ch.actions[i].t)}.`, ch.actions[i].t);
++      else if (d < 0.35) c.add(K, "warn", `"${ch.id}": action "${ch.actions[i - 1].a}" lasts only ${d.toFixed(2)}s before "${ch.actions[i].a}"; the pose will flicker.`, ch.actions[i].t);
++    }
++    for (const w of ch.talk ?? []) if (w[1] - w[0] < 0.25) c.add(K, "warn", `"${ch.id}": talk window ${fmt(w[0])}-${fmt(w[1])} is shorter than 0.25s.`, w[0]);
++  }
++  // expression range for the named cast
++  for (const id of named) {
++    const ch = ep.chars.find((x) => x.id === id);
++    if (!ch) continue;
++    const ex = new Set(ch.actions.map((a) => a.expr ?? DEFAULT_EXPR[a.a] ?? "neutral"));
++    if (ex.size < 2) c.add(K, "warn", `Named character "${id}" shows only ${ex.size} facial expression(s); the audience cannot read their feelings.`);
++  }
++
++  // ---------- performance rules from the reference films ----------
++  let blinkFrames = 0, bounceFrames = 0, talkFrames = 0;
++  for (const ch of ep.chars) for (const [a, b] of ch.talk ?? []) {
++    for (let t = a; t <= b; t += 1 / ep.fps) {
++      talkFrames++;
++      const { pose, blink } = poseAt(ch.actions, ch.talk, t, 1, 0);
++      if (blink) blinkFrames++;
++      if (pose.bob > 1.5) bounceFrames++;
++    }
++  }
++  c.metrics.talkFrames = talkFrames;
++  if (blinkFrames) c.add(K, "warn", `Characters blink during ${blinkFrames} speaking frames; nobody blinks while talking in the reference films.`);
++  if (bounceFrames) c.add(K, "warn", `Characters bounce during ${bounceFrames} speaking frames; reference films hold dead still once a character lands.`);
++
++  // pose pops: a limb teleporting between frames, only while the character is on screen
++  let pops = 0, last: { id: string; p: Pose } | null = null;
++  for (const ch of ep.chars) {
++    last = null;
++    for (const f of c.frames) {
++      const pos = c.R.charWorld(ch, f.t);
++      const pr = project(f.cam, [pos[0], pos[1] + charHeight(ch.scale) / 2, pos[2]], c.aspect);
++      if (!pr || pr.z > 90 || !inFrame(pr)) { last = null; continue; }
++      const { pose } = poseAt(ch.actions, ch.talk, f.t, 1, 0);
++      if (last && (Math.abs(pose.armF[0] - last.p.armF[0]) > 0.6 || Math.abs(pose.armB[0] - last.p.armB[0]) > 0.6 || Math.abs(pose.lean - last.p.lean) > 0.25)) {
++        pops++;
++        if (pops <= 5) c.add(K, "warn", `"${ch.id}" pops between poses at ${fmt(f.t)}.`, f.t);
++      }
++      last = { id: ch.id, p: pose };
++    }
++  }
++  c.metrics.posePops = pops;
++  c.add(K, "info", "Known gap: mouth movement is a procedural sine wave in poseAt(), not driven by the narration audio, so true lip-sync is not implemented yet.");
++};
+diff --git a/src/history/qc/index.ts b/src/history/qc/index.ts
+new file mode 100644
+index 0000000..05a4d9c
+--- /dev/null
++++ b/src/history/qc/index.ts
+@@ -0,0 +1,73 @@
++import type { Episode } from "../types";
++import { makeResolver } from "../engine/entities";
++import { checkAudio } from "./audio";
++import { checkCamera } from "./camera";
++import { checkCharacters } from "./characters";
++import { checkLighting } from "./light";
++import { checkScene } from "./scene";
++import { checkScript } from "./script";
++import type { CheckSummary, Finding, QCOptions, QCReport, Severity, Shot } from "./types";
++import { DEFAULTS, sampleFrames, type Ctx } from "./util";
++
++export type { QCOptions, QCReport, Finding } from "./types";
++
++const ORDER = ["script", "camera", "lighting", "scene", "characters", "audio"];
++
++/** Runs every automated pre-render check on an episode. Pure data: no GPU, no DOM, no rendering. */
++export const runQC = (ep: Episode, opts: QCOptions): QCReport => {
++  const R = makeResolver(ep);
++  const out: Finding[] = [];
++  const metrics: Record<string, number | string> = {};
++  const ctx: Ctx = {
++    ep, R, aspect: opts.aspect, th: { ...DEFAULTS, ...opts.thresholds }, frames: [], dt: 1 / ep.fps, metrics, out,
++    add: (check, severity: Severity, msg, t) => { out.push({ check, severity, msg, t }); },
++  };
++  let shots: Shot[] = [];
++
++  const guard = (name: string, fn: () => void) => {
++    try { fn(); } catch (e) { ctx.add(name, "error", `Check crashed: ${(e as Error).message}. The episode data is probably malformed.`); }
++  };
++
++  // The sampled frames need every camera target to resolve; report that clearly instead of throwing.
++  try { ctx.frames = sampleFrames(ep, R); } catch (e) {
++    ctx.add("camera", "error", `Cannot sample the camera: ${(e as Error).message}`);
++  }
++  guard("script", () => checkScript(ctx));
++  if (ctx.frames.length) {
++    guard("camera", () => { shots = checkCamera(ctx); });
++    guard("scene", () => checkScene(ctx));
++    guard("characters", () => checkCharacters(ctx));
++  }
++  guard("lighting", () => checkLighting(ctx));
++  guard("audio", () => checkAudio(ctx, opts.durations, opts.audioFiles));
++
++  const summary: CheckSummary[] = ORDER.map((check) => ({
++    check,
++    errors: out.filter((f) => f.check === check && f.severity === "error").length,
++    warns: out.filter((f) => f.check === check && f.severity === "warn").length,
++    infos: out.filter((f) => f.check === check && f.severity === "info").length,
++  }));
++  const rank = { error: 0, warn: 1, info: 2 } as const;
++  out.sort((a, b) => ORDER.indexOf(a.check) - ORDER.indexOf(b.check) || rank[a.severity] - rank[b.severity] || (a.t ?? 0) - (b.t ?? 0));
++  return { episode: ep.id, ok: !out.some((f) => f.severity === "error"), summary, metrics, shots, transitions: ep.transitions.map((x) => ({ t: x.t, dur: x.dur })), findings: out };
++};
++
++const ICON = { error: "ERROR", warn: "warn ", info: "info " } as const;
++export const formatReport = (r: QCReport): string => {
++  const L: string[] = [];
++  L.push(`QC report: ${r.episode}   ->   ${r.ok ? "PASS (no errors)" : "FAIL"}`);
++  L.push("");
++  L.push("check       errors  warns  infos");
++  for (const s of r.summary) L.push(`${s.check.padEnd(11)} ${String(s.errors).padStart(6)} ${String(s.warns).padStart(6)} ${String(s.infos).padStart(6)}`);
++  L.push("");
++  L.push("metrics: " + Object.entries(r.metrics).map(([k, v]) => `${k}=${v}`).join("  "));
++  L.push("");
++  L.push("shots: " + r.shots.map((s) => `${s.start.toFixed(1)}-${s.end.toFixed(1)} ${s.type}${s.exit === "hard" ? " [HARD CUT]" : ""}`).join(" | "));
++  L.push("");
++  let cur = "";
++  for (const f of r.findings) {
++    if (f.check !== cur) { cur = f.check; L.push(`[${cur}]`); }
++    L.push(`  ${ICON[f.severity]} ${f.t !== undefined ? `@${f.t.toFixed(1)}s ` : ""}${f.msg}`);
++  }
++  return L.join("\n");
++};
+diff --git a/src/history/qc/light.ts b/src/history/qc/light.ts
+new file mode 100644
+index 0000000..cb18aae
+--- /dev/null
++++ b/src/history/qc/light.ts
+@@ -0,0 +1,52 @@
++import type { AtmoKey } from "../types";
++import { fmt, luma, parseHex, runs, type Ctx } from "./util";
++
++const keyLight = (k: AtmoKey) => k.sunI * luma(parseHex(k.sunCol)) + k.ambI * luma(parseHex(k.ambSky));
++const warmth = (k: AtmoKey) => { const [r, , b] = parseHex(k.sunCol); return r - b; };
++
++export const checkLighting = (c: Ctx) => {
++  const { ep, th } = c;
++  const K = "lighting";
++  const keys = ep.atmo;
++  if (keys.length < 2) { c.add(K, "error", "Fewer than 2 atmosphere keys; lighting never changes."); return; }
++  for (let i = 1; i < keys.length; i++) if (keys[i].t < keys[i - 1].t) c.add(K, "error", `Atmosphere keys out of order at ${fmt(keys[i].t)}.`, keys[i].t);
++  if (keys[0].t > 0.01) c.add(K, "error", "First atmosphere key is not at t=0.");
++  if (keys[keys.length - 1].t < ep.durationSec - 1.5) c.add(K, "warn", `Last atmosphere key is at ${fmt(keys[keys.length - 1].t)}; lighting is held flat to the end.`);
++
++  // intentional light in every second: a directional source with a readable angle
++  const flat = keys.map((k) => k.sunI < 0.3);
++  runs(flat).forEach(([s, e]) => c.add(K, "warn", `Very weak directional light around ${fmt(keys[s].t)}-${fmt(keys[e].t)} (sunI < 0.3). Night scenes need environmental light sources, which the engine does not have yet.`, keys[s].t));
++  for (const k of keys) if (k.sunElev < 0.02 && k.sunI > 0.3) c.add(K, "warn", `Sun is on the horizon (elev ${k.sunElev}) at ${fmt(k.t)}: shadows will be unreadably long.`, k.t);
++
++  // light changes: crossfades between keys that differ strongly
++  const changes: { t: number; mag: number; gradual: boolean }[] = [];
++  for (let i = 1; i < keys.length; i++) {
++    const a = keys[i - 1], b = keys[i];
++    if (b.t - a.t < 1e-3) continue;
++    const la = keyLight(a), lb = keyLight(b);
++    const rel = Math.abs(lb - la) / Math.max(la, lb, 1e-3);
++    const col = Math.abs(warmth(a) - warmth(b)) * 0.8;
++    const mag = Math.max(rel, col);
++    if (mag >= th.lightChange) changes.push({ t: (a.t + b.t) / 2, mag, gradual: b.t - a.t > 2.5 });
++  }
++  c.metrics.lightChanges = changes.length;
++  // a light change with no scene change under it is a continuity error (the sky would visibly "pop")
++  for (const ch of changes) {
++    if (ch.gradual) continue; // a slow drift over > 2.5 s reads as time passing, not as a pop
++    const covered = ep.transitions.some((tr) => Math.abs(tr.t - ch.t) <= tr.dur / 2 + 1.0);
++    if (!covered) c.add(K, ch.mag > 0.4 ? "error" : "warn", `Lighting shifts by ${(ch.mag * 100).toFixed(0)}% at ${fmt(ch.t)} with no scene change to hide it.`, ch.t);
++  }
++  // light should change when the story turns
++  for (const b of ep.story?.beats ?? []) {
++    if (b.kind !== "conflict" && b.kind !== "twist" && b.kind !== "escalation") continue;
++    if (!changes.some((x) => Math.abs(x.t - b.t) <= 2.5)) c.add(K, "warn", `The "${b.kind}" beat at ${fmt(b.t)} (${b.note}) has no lighting change within 2.5s; the light should turn with the story.`, b.t);
++  }
++  // colour mood variety
++  const warm = keys.filter((k) => warmth(k) > 0.25).length;
++  const cool = keys.filter((k) => warmth(k) <= 0.25).length;
++  c.metrics.lightWarmKeys = warm; c.metrics.lightCoolKeys = cool;
++  if (!warm || !cool) c.add(K, "warn", `Only ${warm ? "warm" : "cool"} sun colours are used; mix warm and cool light for contrast.`);
++  const lows = keys.filter((k) => k.sunElev < 0.35 && k.sunI > 0.3).length;
++  c.metrics.lowSunKeys = lows;
++  if (!lows) c.add(K, "warn", "No low-sun key: shadows are never long and dramatic.");
++};
+diff --git a/src/history/qc/scene.ts b/src/history/qc/scene.ts
+new file mode 100644
+index 0000000..05f1e60
+--- /dev/null
++++ b/src/history/qc/scene.ts
+@@ -0,0 +1,87 @@
++import { SHIP_DIMS } from "../engine/entities";
++import type { Vec3 } from "../engine/math";
++import { charHeight, fmt, inFrame, project, runs, type Ctx } from "./util";
++
++export const checkScene = (c: Ctx) => {
++  const { ep, th, frames, R } = c;
++  const K = "scene";
++
++  // ---------- environment consistency (references, ordering, scale) ----------
++  const shipIds = new Set(ep.ships.map((s) => s.id));
++  const charIds = new Set(ep.chars.map((s) => s.id));
++  const dup = (a: string[], what: string) => { const s = new Set<string>(); for (const x of a) { if (s.has(x)) c.add(K, "error", `Duplicate ${what} id "${x}".`); s.add(x); } };
++  dup(ep.ships.map((s) => s.id), "ship"); dup(ep.chars.map((s) => s.id), "character"); dup(ep.islands.map((s) => s.id), "island");
++  for (const id of charIds) if (shipIds.has(id)) c.add(K, "error", `"${id}" is both a ship and a character; camera targets would be ambiguous.`);
++  const known = (id: string) => shipIds.has(id) || charIds.has(id);
++  for (const k of ep.cameras) for (const id of [k.target, k.lookTarget]) if (id && !known(id)) c.add(K, "error", `Camera key at ${fmt(k.t)} targets unknown entity "${id}".`, k.t);
++  for (const ch of ep.chars) {
++    if (ch.ship && !shipIds.has(ch.ship)) c.add(K, "error", `Character "${ch.id}" stands on unknown ship "${ch.ship}".`);
++    for (const m of ch.moves ?? []) if (!shipIds.has(m.ship)) c.add(K, "error", `Character "${ch.id}" moves to unknown ship "${m.ship}".`);
++  }
++  for (const e of ep.fx) for (const id of [e.ship, e.target]) if (id && !shipIds.has(id)) c.add(K, "error", `FX event at ${fmt(e.t)} references unknown ship "${id}".`, e.t);
++  for (const tr of ep.transitions) if (tr.t - tr.dur / 2 < 0 || tr.t + tr.dur / 2 > ep.durationSec) c.add(K, "error", `Transition at ${fmt(tr.t)} runs outside the film.`, tr.t);
++  for (const s of ep.ships) {
++    const sc = s.scale ?? 1;
++    if (sc < 0.5 || sc > 2) c.add(K, "warn", `Ship "${s.id}" scale ${sc} breaks realistic proportions against other ships and characters.`);
++  }
++  for (const i of ep.islands) if (i.radius < 15) c.add(K, "warn", `Island "${i.id}" radius ${i.radius} m is smaller than a ship's length.`);
++  // known engine limitation, reported every time so it is never forgotten
++  c.add(K, "info", "World catalog: ocean, sky, ships, islands (palms / houses / fort) and gulls only. Streets, buildings, interiors, furniture and props are not supported yet.");
++
++  // ---------- character positioning ----------
++  for (const ch of ep.chars) {
++    if (ch.ship) {
++      const ship = ep.ships.find((s) => s.id === ch.ship);
++      if (!ship) continue;
++      const { L, B } = SHIP_DIMS[ship.kind];
++      const [x, y, z] = ch.local;
++      if (Math.abs(x) > (B / 2) * 1.15 || Math.abs(z) > (L / 2) * 1.1) c.add(K, "error", `"${ch.id}" stands outside the ${ship.kind} hull footprint (local ${x}, ${z}).`);
++      if (y < -0.5 || y > 12) c.add(K, "warn", `"${ch.id}" is at deck height ${y} m, which is implausible for a ${ship.kind}.`);
++    } else if (ep.islands.length) {
++      const near = ep.islands.some((i) => Math.hypot(ch.local[0] - i.at[0], ch.local[2] - i.at[1]) <= i.radius * 1.15);
++      if (!near) c.add(K, "warn", `"${ch.id}" has no ship and is not on an island; it would float on the sea.`);
++    }
++  }
++  for (let a = 0; a < ep.chars.length; a++) for (let b = a + 1; b < ep.chars.length; b++) {
++    const A = ep.chars[a], B = ep.chars[b];
++    if (A.ship && A.ship === B.ship && Math.hypot(A.local[0] - B.local[0], A.local[1] - B.local[1], A.local[2] - B.local[2]) < 0.35) c.add(K, "warn", `"${A.id}" and "${B.id}" stand on top of each other on ${A.ship}.`);
++  }
++
++  // ---------- scene density ----------
++  const step = Math.max(1, Math.round(ep.fps / 4));
++  const idx: number[] = [];
++  for (let i = 0; i < frames.length; i += step) idx.push(i);
++  const counts = idx.map((i) => {
++    const f = frames[i];
++    const seen = new Set<string>();
++    for (const s of ep.ships) {
++      const st = R.shipAt(s.id, f.t);
++      const { L } = SHIP_DIMS[s.kind];
++      const fx = Math.sin(st.heading), fz = Math.cos(st.heading);
++      for (const k of [-0.4, 0, 0.4]) {
++        const pr = project(f.cam, [st.x + fx * L * k, st.y + 3, st.z + fz * L * k] as Vec3, c.aspect);
++        if (pr && pr.z < 450 && inFrame(pr, 0.15)) { seen.add("s:" + s.id); break; }
++      }
++    }
++    for (const isl of ep.islands) {
++      const pr = project(f.cam, [isl.at[0], isl.peak * 0.4, isl.at[1]], c.aspect);
++      if (pr && pr.z < 700 && inFrame(pr, 0.6)) seen.add("i:" + isl.id);
++    }
++    for (const ch of ep.chars) {
++      const p = R.charWorld(ch, f.t);
++      const pr = project(f.cam, [p[0], p[1] + charHeight(ch.scale) / 2, p[2]], c.aspect);
++      if (pr && pr.z < 90 && inFrame(pr)) { seen.add("c:" + ch.id); if (ch.ship) seen.add("s:" + ch.ship); }
++    }
++    for (const [gi, g] of ep.gulls.entries()) { const pr = project(f.cam, g.at, c.aspect); if (pr && pr.z < 150 && inFrame(pr)) seen.add("g:" + gi); }
++    for (const e of ep.fx) if (Math.abs(e.t - f.t) < 1) seen.add("x:" + e.kind);
++    return seen.size;
++  });
++  const dtc = step / ep.fps;
++  const sparse = counts.map((n) => n < th.minElements);
++  for (const [s, e] of runs(sparse)) {
++    const dur = (e - s + 1) * dtc;
++    if (dur >= th.sparseWarn) c.add(K, dur >= th.sparseError ? "error" : "warn", `Sparse frame for ${dur.toFixed(1)}s at ${fmt(frames[idx[s]].t)}: fewer than ${th.minElements} scene elements in view (looks like empty sea / sky).`, frames[idx[s]].t);
++  }
++  c.metrics.avgSceneElements = +(counts.reduce((a, b) => a + b, 0) / counts.length).toFixed(1);
++  c.metrics.sparseSeconds = +(sparse.filter(Boolean).length * dtc).toFixed(1);
++};
+diff --git a/src/history/qc/script.ts b/src/history/qc/script.ts
+new file mode 100644
+index 0000000..dddb0f0
+--- /dev/null
++++ b/src/history/qc/script.ts
+@@ -0,0 +1,110 @@
++import type { BeatKind } from "../types";
++import { fmt, inFrame, project, type Ctx } from "./util";
++import { charHeight } from "./util";
++
++const words = (s: string) => s.split(/\s+/).filter(Boolean).length;
++const YEAR = /\b(1[0-9]{3}|20[0-9]{2})\b/;
++
++/** Scene boundaries = transition centres; scenes are the spans between them. */
++export const scenesOf = (c: Ctx): { start: number; end: number }[] => {
++  const cuts = [0, ...c.ep.transitions.map((x) => x.t).sort((a, b) => a - b), c.ep.durationSec];
++  const out: { start: number; end: number }[] = [];
++  for (let i = 0; i < cuts.length - 1; i++) if (cuts[i + 1] - cuts[i] > 0.05) out.push({ start: cuts[i], end: cuts[i + 1] });
++  return out;
++};
++
++export const checkScript = (c: Ctx) => {
++  const { ep, th } = c;
++  const N = ep.narration;
++  const K = "script";
++
++  if (!N.length) { c.add(K, "error", "Episode has no narration."); return; }
++  if (Math.abs(ep.durationSec - 60) > 1.5) c.add(K, "warn", `Runtime is ${ep.durationSec}s; the target is 60s.`);
++
++  // --- immediate hook ---
++  const first = N[0];
++  if (first.start > th.hookMaxStart) c.add(K, "warn", `Narration starts at ${fmt(first.start)}; the hook should start within ${th.hookMaxStart}s.`, first.start);
++  const firstSentence = first.text.split(/(?<=[.?!])\s/)[0] ?? first.text;
++  if (!/\?|\d|!/.test(firstSentence)) c.add(K, "warn", `Opening line is not an obvious hook (no question, number or exclamation): "${firstSentence}"`, first.start);
++
++  // --- clear historical setting ---
++  let yearAt: number | null = null;
++  for (const n of N) if (YEAR.test(n.text)) { yearAt = n.start; break; }
++  if (yearAt === null) c.add(K, "warn", "No year is ever spoken, so the historical setting is not anchored in time.");
++  else if (yearAt > th.settingMaxT) c.add(K, "warn", `The historical setting (a year) is first spoken at ${fmt(yearAt)}; viewers should know when/where within ${th.settingMaxT}s.`, yearAt);
++  c.metrics.settingSpokenAt = yearAt === null ? "never" : yearAt.toFixed(1);
++
++  // --- narration timing and pace ---
++  let spoken = 0;
++  N.forEach((n, i) => {
++    if (n.end <= n.start) c.add(K, "error", `Narration ${n.id} has end <= start.`, n.start);
++    if (n.end > ep.durationSec - 0.3) c.add(K, "error", `Narration ${n.id} runs past the end fade (${fmt(n.end)}).`, n.end);
++    const w = words(n.text);
++    const wps = w / Math.max(0.01, n.end - n.start);
++    spoken += n.end - n.start;
++    if (wps > th.paceMax) c.add(K, "warn", `${n.id}: ${wps.toFixed(1)} words/s is too fast to read or follow (max ${th.paceMax}).`, n.start);
++    if (wps < th.paceMin) c.add(K, "warn", `${n.id}: ${wps.toFixed(1)} words/s leaves dead air (min ${th.paceMin}).`, n.start);
++    const next = N[i + 1];
++    if (next && next.start < n.end) c.add(K, "error", `${n.id} overlaps ${next.id}.`, next.start);
++  });
++  c.metrics.narrationCoverage = +(spoken / ep.durationSec).toFixed(2);
++  c.metrics.narrationWords = N.reduce((a, n) => a + words(n.text), 0);
++  if (spoken / ep.durationSec < 0.55) c.add(K, "warn", `Narration covers only ${Math.round((100 * spoken) / ep.durationSec)}% of the runtime.`);
++
++  // --- scenes must have a purpose (no filler) ---
++  const scenes = scenesOf(c);
++  c.metrics.scenes = scenes.length;
++  scenes.forEach((s, i) => {
++    const covered = N.reduce((a, n) => a + Math.max(0, Math.min(n.end, s.end) - Math.max(n.start, s.start)), 0);
++    if (covered < 0.5 * (s.end - s.start)) c.add(K, "warn", `Scene ${i + 1} (${fmt(s.start)}-${fmt(s.end)}) is only ${Math.round((100 * covered) / (s.end - s.start))}% narrated; is it filler?`, s.start);
++    if (ep.story) {
++      const hasBeat = ep.story.beats.some((b) => b.t >= s.start - 1.5 && b.t < s.end);
++      if (!hasBeat) c.add(K, "info", `Scene ${i + 1} (${fmt(s.start)}-${fmt(s.end)}) is not linked to a story beat.`, s.start);
++    }
++  });
++  // scene changes mid-sentence are legal, but report them so they are a conscious choice
++  for (const tr of ep.transitions) {
++    const nearest = Math.min(...N.flatMap((n) => [Math.abs(n.start - tr.t), Math.abs(n.end - tr.t)]));
++    if (nearest > 0.9) c.add(K, "info", `Scene change at ${fmt(tr.t)} falls mid-sentence (nearest narration boundary ${nearest.toFixed(1)}s away).`, tr.t);
++  }
++
++  // --- story plan ---
++  const S = ep.story;
++  if (!S) { c.add(K, "warn", "Episode has no `story` plan, so the arc (hook, setting, conflict, twist, resolution) cannot be verified."); return; }
++  const need: BeatKind[] = ["hook", "setting", "conflict", "twist", "resolution"];
++  for (const k of need) if (!S.beats.some((b) => b.kind === k)) c.add(K, "error", `Story plan has no "${k}" beat.`);
++  const order: BeatKind[] = ["hook", "setting", "conflict", "escalation", "twist", "resolution"];
++  const rank = (k: BeatKind) => order.indexOf(k);
++  const bs = [...S.beats].sort((a, b) => a.t - b.t);
++  for (let i = 1; i < bs.length; i++) if (rank(bs[i].kind) < rank(bs[i - 1].kind)) c.add(K, "warn", `Beat "${bs[i].kind}" (${fmt(bs[i].t)}) comes after "${bs[i - 1].kind}" (${fmt(bs[i - 1].t)}); the arc is out of order.`, bs[i].t);
++  const at = (k: BeatKind) => S.beats.find((b) => b.kind === k)?.t;
++  const hook = at("hook"), twist = at("twist"), res = at("resolution");
++  if (hook !== undefined && hook > 2) c.add(K, "warn", `Hook beat is at ${fmt(hook)}; it should be in the first 2s.`, hook);
++  if (twist !== undefined && (twist < ep.durationSec * 0.55 || twist > ep.durationSec * 0.92)) c.add(K, "warn", `Twist at ${fmt(twist)} is outside the 55-92% window (${fmt(ep.durationSec * 0.55)}-${fmt(ep.durationSec * 0.92)}); suspense will not land.`, twist);
++  if (res !== undefined && res < ep.durationSec - 12) c.add(K, "warn", `Resolution starts at ${fmt(res)}, more than 12s before the end.`, res);
++
++  // --- protagonist and supporting cast ---
++  const ids = new Set(ep.chars.map((x) => x.id));
++  if (!S.protagonist) c.add(K, "warn", "Story plan names no protagonist.");
++  else if (!ids.has(S.protagonist)) c.add(K, "error", `Protagonist "${S.protagonist}" is not a character in this episode.`);
++  for (const s of S.supporting ?? []) if (!ids.has(s)) c.add(K, "error", `Supporting character "${s}" does not exist.`);
++  if ((S.supporting ?? []).length < 1) c.add(K, "warn", "Story plan lists no supporting characters.");
++
++  if (S.protagonist && ids.has(S.protagonist)) {
++    const ch = ep.chars.find((x) => x.id === S.protagonist)!;
++    const H = charHeight(ch.scale);
++    const perScene = scenes.map((s) => {
++      let n = 0;
++      for (const f of c.frames) {
++        if (f.t < s.start || f.t >= s.end || f.i % 3) continue;
++        const p = c.R.charWorld(ch, f.t);
++        const pr = project(f.cam, [p[0], p[1] + H / 2, p[2]], c.aspect);
++        if (inFrame(pr) && pr!.z < 120) n += 3 / ep.fps;
++      }
++      return n;
++    });
++    const present = perScene.filter((x) => x >= 1).length;
++    c.metrics.protagonistScenes = `${present}/${scenes.length}`;
++    if (present < Math.min(3, scenes.length)) c.add(K, "warn", `Protagonist "${S.protagonist}" is on screen in only ${present} of ${scenes.length} scenes; the audience cannot follow a character who barely appears.`);
++  }
++};
+diff --git a/src/history/qc/types.ts b/src/history/qc/types.ts
+new file mode 100644
+index 0000000..ddd4020
+--- /dev/null
++++ b/src/history/qc/types.ts
+@@ -0,0 +1,77 @@
++export type Severity = "error" | "warn" | "info";
++
++export interface Finding {
++  /** check group, e.g. "camera", "lighting" */
++  check: string;
++  severity: Severity;
++  /** time in seconds the finding refers to (if any) */
++  t?: number;
++  msg: string;
++}
++
++/** Tunable limits. Every default is a heuristic, documented in docs/ENGINE.md. */
++export interface Thresholds {
++  /** first narration must start by this time (immediate hook) */
++  hookMaxStart: number;
++  /** a year / clear setting must be spoken by this time */
++  settingMaxT: number;
++  /** narration pace limits, words per second */
++  paceMin: number;
++  paceMax: number;
++  /** first on-screen character face: warn / error (seconds) */
++  firstFaceWarn: number;
++  firstFaceError: number;
++  /** character height as fraction of frame height to count as a visible face */
++  faceFrac: number;
++  /** camera world speed (m/s) above which a frame pair is a scene jump */
++  jumpSpeed: number;
++  /** camera turn per frame (degrees) above which a frame pair is a scene jump */
++  jumpAngle: number;
++  /** camera turn in frame widths per frame at/above which an unmasked move is a hard cut (below it: a violent whip-pan warning) */
++  hardCutWidths: number;
++  /** a jump must lie within a transition window padded by this many seconds */
++  maskPad: number;
++  /** scene jumps per 10 s above which the rhythm is flagged */
++  cutsPer10Warn: number;
++  /** FOV change speed (deg/s) above which a zoom is flagged as not smooth */
++  fovRateMax: number;
++  /** seconds of sparse frames (< minElements scene elements) that warn / error */
++  sparseWarn: number;
++  sparseError: number;
++  minElements: number;
++  /** relative light change (0..1) between atmosphere keys that counts as a lighting change */
++  lightChange: number;
++  /** minimum camera clearance (m) to a character before the billboard clips */
++  camClear: number;
++}
++
++export interface QCOptions {
++  /** frame aspect ratio (width / height) */
++  aspect: number;
++  /** narration durations from public/audio/<ep>/manifest.json, if generated */
++  durations?: Record<string, number> | null;
++  /** audio file names that exist (or are planned by the generator); null = unknown */
++  audioFiles?: Set<string> | null;
++  thresholds?: Partial<Thresholds>;
++}
++
++export interface Shot {
++  start: number;
++  end: number;
++  type: "wide" | "medium" | "close-up" | "detail";
++  /** how this shot ends: a masked jump (transition covers it), an unmasked hard cut, or the end of the film */
++  exit: "masked" | "hard" | "end";
++}
++
++export interface CheckSummary { check: string; errors: number; warns: number; infos: number }
++
++export interface QCReport {
++  episode: string;
++  ok: boolean;
++  summary: CheckSummary[];
++  metrics: Record<string, number | string>;
++  shots: Shot[];
++  /** scene-change wipes, so pixel QC can skip frames a wipe intentionally fills */
++  transitions: { t: number; dur: number }[];
++  findings: Finding[];
++}
+diff --git a/src/history/qc/util.ts b/src/history/qc/util.ts
+new file mode 100644
+index 0000000..c03d75d
+--- /dev/null
++++ b/src/history/qc/util.ts
+@@ -0,0 +1,98 @@
++import type { Episode } from "../types";
++import type { CamState } from "../engine/camera";
++import { sampleCamera } from "../engine/camera";
++import type { Resolver } from "../engine/entities";
++import { cross3, norm3, sub3, type Vec3 } from "../engine/math";
++import type { Finding, Severity, Thresholds } from "./types";
++
++export const DEFAULTS: Thresholds = {
++  hookMaxStart: 1.0,
++  settingMaxT: 15,
++  paceMin: 1.5,
++  paceMax: 3.6,
++  firstFaceWarn: 8,
++  firstFaceError: 15,
++  faceFrac: 0.12,
++  jumpSpeed: 120,
++  jumpAngle: 12,
++  hardCutWidths: 0.8,
++  maskPad: 0.35,
++  cutsPer10Warn: 1.5,
++  fovRateMax: 60,
++  sparseWarn: 1.5,
++  sparseError: 3,
++  minElements: 2,
++  lightChange: 0.15,
++  camClear: 0.6,
++};
++
++export interface Frame { i: number; t: number; cam: CamState }
++
++export interface Ctx {
++  ep: Episode;
++  R: Resolver;
++  aspect: number;
++  th: Thresholds;
++  frames: Frame[];
++  dt: number;
++  metrics: Record<string, number | string>;
++  out: Finding[];
++  add: (check: string, severity: Severity, msg: string, t?: number) => void;
++}
++
++export const sampleFrames = (ep: Episode, R: Resolver): Frame[] => {
++  const n = Math.round(ep.durationSec * ep.fps);
++  const out: Frame[] = [];
++  for (let i = 0; i < n; i++) {
++    const t = i / ep.fps;
++    out.push({ i, t, cam: sampleCamera(ep.cameras, t, R, ep.shakes) });
++  }
++  return out;
++};
++
++const dot = (a: Vec3, b: Vec3) => a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
++
++/** Pinhole projection. Returns NDC x/y (-1..1 = inside the frame) and depth, or null if behind the camera. */
++export const project = (cam: CamState, p: Vec3, aspect: number) => {
++  const f = norm3(sub3(cam.look, cam.pos));
++  const r = norm3(cross3(f, [0, 1, 0]));
++  const u = cross3(r, f);
++  const d = sub3(p, cam.pos);
++  const z = dot(d, f);
++  if (z <= 0.1) return null;
++  const th = Math.tan((cam.fov * Math.PI) / 360);
++  return { x: dot(d, r) / (z * th * aspect), y: dot(d, u) / (z * th), z, th };
++};
++
++export const inFrame = (pr: ReturnType<typeof project>, margin = 0) =>
++  !!pr && Math.abs(pr.x) <= 1 + margin && Math.abs(pr.y) <= 1 + margin;
++
++/** contiguous runs of `true` as [startIndex, endIndex] (inclusive) */
++export const runs = (flags: boolean[]): [number, number][] => {
++  const out: [number, number][] = [];
++  let s = -1;
++  flags.forEach((f, i) => {
++    if (f && s < 0) s = i;
++    if (!f && s >= 0) { out.push([s, i - 1]); s = -1; }
++  });
++  if (s >= 0) out.push([s, flags.length - 1]);
++  return out;
++};
++
++export const median = (a: number[]) => {
++  if (!a.length) return 0;
++  const s = [...a].sort((x, y) => x - y);
++  const m = Math.floor(s.length / 2);
++  return s.length % 2 ? s[m] : (s[m - 1] + s[m]) / 2;
++};
++
++export const fmt = (t: number) => t.toFixed(1) + "s";
++
++export const parseHex = (h: string): [number, number, number] => {
++  const n = parseInt(h.replace("#", ""), 16);
++  return [((n >> 16) & 255) / 255, ((n >> 8) & 255) / 255, (n & 255) / 255];
++};
++export const luma = (c: [number, number, number]) => 0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2];
++
++/** world height of a character billboard (matches Character.tsx: 2.55 * scale * 1.55) */
++export const charHeight = (scale: number) => 2.55 * scale * 1.55;
+diff --git a/src/history/types.ts b/src/history/types.ts
+index af89ece..2281eb9 100644
+--- a/src/history/types.ts
++++ b/src/history/types.ts
+@@ -115,9 +115,24 @@ export interface ShakeEvent { t: number; amp: number; dur: number }
+ export interface IslandSpec { id: string; at: [number, number]; radius: number; peak: number; seed: number; palms: number; houses?: number; fort?: boolean; rot?: number; sandOnly?: boolean }
+ export interface GullFlock { at: Vec3; n: number; seed: number; r: number; speed: number }
+ 
++/** Story structure of a 60 s episode. Used by the QC script checks (src/history/qc/script.ts). */
++export type BeatKind = "hook" | "setting" | "conflict" | "escalation" | "twist" | "resolution";
++export interface StoryBeat { t: number; kind: BeatKind; note: string }
++export interface StoryPlan {
++  logline: string;
++  setting: { place: string; year?: number };
++  /** CharSpec id of the protagonist (should appear in several scenes) */
++  protagonist?: string;
++  /** CharSpec ids of supporting characters */
++  supporting?: string[];
++  beats: StoryBeat[];
++}
++
+ export interface Episode {
+   id: string;
+   title: string;
++  /** optional story plan; when present the script QC checks the structure against it */
++  story?: StoryPlan;
+   fps: number;
+   durationSec: number;
+   ships: ShipSpec[];

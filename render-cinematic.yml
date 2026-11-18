@@ -1,0 +1,70 @@
+name: Render History Video (staged + QC)
+
+# Manual only. The original "Render History Video" workflow is unchanged and still works.
+# This one runs the pre-render QC gate, renders in cached chunks, stitches and verifies the result.
+on:
+  workflow_dispatch:
+    inputs:
+      chunk_seconds:
+        description: Seconds per render stage (smaller = less memory, finer resume points)
+        default: "15"
+      ignore_qc:
+        description: Render even if the QC reports errors
+        type: boolean
+        default: false
+
+concurrency:
+  group: render-cinematic-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  render:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - name: Install narration voice + ffmpeg
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y espeak-ng ffmpeg
+      - name: Generate audio (music, sfx, narration)
+        env:
+          ELEVENLABS_API_KEY: ${{ secrets.ELEVENLABS_API_KEY }}
+          ELEVENLABS_VOICE_ID: ${{ secrets.ELEVENLABS_VOICE_ID }}
+        run: node scripts/generate-audio.mjs
+      - run: npx remotion browser ensure
+      - name: Type check
+        run: npx tsc --noEmit
+      - name: QC self-test (does the QC itself still catch known faults?)
+        run: node scripts/qc-selftest.mjs
+      - name: Pre-render QC (data)
+        run: node scripts/qc.mjs
+      - name: Pre-render QC (pixels, report only)
+        run: node scripts/qc-frames.mjs --every 3
+        continue-on-error: true
+      - name: Restore render cache
+        uses: actions/cache@v4
+        with:
+          path: out/chunks
+          key: chunks-${{ github.sha }}
+          restore-keys: chunks-
+      - name: Staged render
+        run: node scripts/render-staged.mjs --chunk-seconds ${{ inputs.chunk_seconds }} --out out/history-pirates.mp4 ${{ inputs.ignore_qc && '--ignore-qc' || '' }}
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: qc-reports
+          path: |
+            out/qc/*.txt
+            out/qc/*.json
+            out/qc/frames/*.jpg
+            out/render-manifest.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: history-pirates
+          path: out/history-pirates.mp4
