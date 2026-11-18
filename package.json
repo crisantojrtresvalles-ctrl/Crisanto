@@ -35,7 +35,11 @@
     "dev": "remotion studio",
     "build": "remotion bundle",
     "upgrade": "remotion upgrade",
-    "lint": "eslint src && tsc"
+    "lint": "eslint src && tsc",
+    "qc": "node scripts/qc.mjs",
+    "qc:test": "node scripts/qc-selftest.mjs",
+    "qc:frames": "node scripts/qc-frames.mjs",
+    "render:staged": "node scripts/render-staged.mjs"
   },
   "allowScripts": {
     "esbuild": false

@@ -15,7 +15,7 @@ export const EXPR: Record<Expr, Partial<Pose>> = {
   shock: { brow: 1.1, eyeWide: 1.3, mouth: 0.85 }, smug: { smile: 0.7, brow: -0.3, eyeWide: -0.5 }, shout: { mouth: 1, brow: -0.7, smile: 0.2 },
   confused: { brow: 0.6, browTilt: 1, smile: -0.3, mouth: 0.1 }, curious: { brow: 0.7, smile: 0.3, eyeWide: 0.4 },
 };
-const DEFAULT_EXPR: Partial<Record<ActionName, Expr>> = {
+export const DEFAULT_EXPR: Partial<Record<ActionName, Expr>> = {
   panic: "scared", cower: "scared", surrender: "shock", shout: "shout", menace: "angry", slash: "angry", haul: "angry",
   laugh: "grin", cheer: "grin", wave: "grin", leap: "shout", fire: "smug", point: "smug", aim: "angry", brace: "scared",
   dance1: "happy", dance2: "grin", dance3: "happy", confused: "confused", watch: "curious", argue: "angry", play: "happy",
@@ -85,5 +85,7 @@ export const poseAt = (actions: CharAction[], talk: [number, number][] | undefin
   if (speaking) pose.mouth = Math.max(pose.mouth, 0.2 + 0.7 * Math.abs(Math.sin(t * 17 + seed)) * (0.6 + 0.4 * Math.sin(t * 5.3)));
   pose.lean += sway * 0.7;
   const ph = (t * 0.9 + hash(seed) * 3) % 3.3;
-  return { pose, blink: ph < 0.13 ? 1 : 0 };
+  // nobody blinks while talking (reference rule): hold the eyes open through speech plus a short margin
+  const holdOpen = (talk ?? []).some(([a, b]) => t >= a - 0.15 && t <= b + 0.15);
+  return { pose, blink: !holdOpen && ph < 0.13 ? 1 : 0 };
 };

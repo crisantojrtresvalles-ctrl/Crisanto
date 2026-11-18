@@ -115,9 +115,24 @@ export interface ShakeEvent { t: number; amp: number; dur: number }
 export interface IslandSpec { id: string; at: [number, number]; radius: number; peak: number; seed: number; palms: number; houses?: number; fort?: boolean; rot?: number; sandOnly?: boolean }
 export interface GullFlock { at: Vec3; n: number; seed: number; r: number; speed: number }
 
+/** Story structure of a 60 s episode. Used by the QC script checks (src/history/qc/script.ts). */
+export type BeatKind = "hook" | "setting" | "conflict" | "escalation" | "twist" | "resolution";
+export interface StoryBeat { t: number; kind: BeatKind; note: string }
+export interface StoryPlan {
+  logline: string;
+  setting: { place: string; year?: number };
+  /** CharSpec id of the protagonist (should appear in several scenes) */
+  protagonist?: string;
+  /** CharSpec ids of supporting characters */
+  supporting?: string[];
+  beats: StoryBeat[];
+}
+
 export interface Episode {
   id: string;
   title: string;
+  /** optional story plan; when present the script QC checks the structure against it */
+  story?: StoryPlan;
   fps: number;
   durationSec: number;
   ships: ShipSpec[];

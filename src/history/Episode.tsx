@@ -43,7 +43,7 @@ const lightning = (ep: Ep, t: number) => {
   return Math.min(1.2, f);
 };
 
-export const EpisodeView: React.FC<{ episode: Ep; durations: Record<string, number> | null; audio: boolean }> = ({ episode: ep, durations, audio }) => {
+export const EpisodeView: React.FC<{ episode: Ep; durations: Record<string, number> | null; audio: boolean; plain?: boolean }> = ({ episode: ep, durations, audio, plain }) => {
   const frame = useCurrentFrame();
   const { fps, width, height } = useVideoConfig();
   const t = frame / fps;
@@ -92,11 +92,15 @@ export const EpisodeView: React.FC<{ episode: Ep; durations: Record<string, numb
           <Wipes list={ep.transitions} t={t} cam={cam} atmo={atmo} />
         </ThreeCanvas>
       </div>
-      <Vignette />
-      <TitleCard t={t} />
-      <Callouts t={t} list={ep.callouts} />
-      <Subtitles t={t} lines={ep.narration} durations={durations} />
-      <div style={{ position: "absolute", inset: 0, background: "#000", opacity: Math.max(fadeOut, fadeIn), pointerEvents: "none" }} />
+      {!plain && (
+        <>
+          <Vignette />
+          <TitleCard t={t} />
+          <Callouts t={t} list={ep.callouts} />
+          <Subtitles t={t} lines={ep.narration} durations={durations} />
+          <div style={{ position: "absolute", inset: 0, background: "#000", opacity: Math.max(fadeOut, fadeIn), pointerEvents: "none" }} />
+        </>
+      )}
       {audio && durations && <AudioLayer ep={ep} durations={durations} />}
     </AbsoluteFill>
   );

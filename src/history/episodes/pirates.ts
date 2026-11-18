@@ -103,8 +103,8 @@ const C = (t: number, id: string, off: Vec3, lookOff: Vec3, fov: number, o: Part
 const cameras: CamKey[] = [
   // S1 hook: low wide -> rise & follow the sloop
   K(0, [0, 0.9, 0], [1, 3.2, 60], 64, { shake: 0.8 }),
-  K(2.6, [-1, 1.7, 1.5], [0.5, 5.2, 36], 54, { shake: 0.6 }),
-  K(4.5, [-2.2, 2.5, 3], [2, 5, 18], 48, { shake: 0.9 }),
+  K(2.6, [-1, 3.4, 1.5], [0.5, 5.2, 36], 54, { shake: 0.6 }),
+  K(4.5, [-2.2, 3.8, 3], [2, 5, 18], 48, { shake: 0.9 }),
   K(5.8, [-3, 3.1, 4], [2.5, 4.5, 3], 44, { shake: 1.0, ease: "snap", whip: 0.9 }),
   // S2 sloop design: full ship -> mast -> sail -> waterline -> wide cove
   O(6.8, "sB", 2.2, 0.12, 31, [0, 5.5, 0], 55, { shake: 0.5 }),
@@ -115,7 +115,7 @@ const cameras: CamKey[] = [
   O(13.0, "sB", 0.8, 0.32, 54, [-7, 3, 7], 58, { ease: "snap", whip: -0.8 }),
   // S3a careening on the beach
   K(13.7, [790, 3.4, -15], [770, 2.4, -1], 56, { shake: 0.3 }),
-  K(15.2, [782, 2.4, -8], [772.5, 2.4, -1.5], 48, { shake: 0.3 }),
+  K(15.2, [782, 3.9, -8], [772.5, 2.4, -1.5], 48, { shake: 0.3 }),
   K(16.0, [777, 2.0, -6], [773.6, 2.0, -3], 40, { ease: "snap", whip: 0.7 }),
   // S3b chase
   O(16.7, "sD", 1.25, 0.1, 24, [0, 4, 2], 58, { shake: 0.6 }),
@@ -193,7 +193,7 @@ const sfx: SfxCue[] = [
   { t: 33.65, file: "whoosh2.wav", vol: 0.9 },
   { t: 36.0, file: "hook.wav", vol: 0.8 }, { t: 36.18, file: "hook.wav", vol: 0.8 }, { t: 36.36, file: "hook.wav", vol: 0.8 },
   { t: 36.9, file: "thud.wav", vol: 0.9 }, { t: 38.3, file: "thud.wav", vol: 0.8 }, { t: 38.8, file: "thud.wav", vol: 0.7 }, { t: 39.2, file: "gasp.wav", vol: 0.6 },
-  { t: 40.75, file: "whoosh.wav", vol: 0.9 },
+  { t: 40.75, file: "whoosh.wav", vol: 0.9 }, { t: 31.2, file: "whoosh2.wav", vol: 0.8 },
   { t: 42.5, file: "creak.wav", vol: 0.6 }, { t: 45.8, file: "thud.wav", vol: 0.8 }, { t: 46.4, file: "thud.wav", vol: 0.8 }, { t: 47.0, file: "thud.wav", vol: 0.8 }, { t: 47.6, file: "thud.wav", vol: 0.8 },
   { t: 49.9, file: "hiss.wav", vol: 0.7 }, { t: 52.0, file: "musket.wav", vol: 0.5 }, { t: 53.4, file: "whoosh2.wav", vol: 0.6 }, { t: 53.8, file: "flap.wav", vol: 0.6 },
   { t: 55.2, file: "whoosh.wav", vol: 0.7 }, { t: 57.0, file: "gull.wav", vol: 0.5 }, { t: 58.4, file: "gull.wav", vol: 0.4 },
@@ -205,6 +205,20 @@ export const pirates: Episode = {
   title: "What Made Pirate Ships So Dangerous?",
   fps: 30,
   durationSec: 60,
+  story: {
+    logline: "How a handful of pirates captured giant merchant ships: speed, fear and firepower, ending with Blackbeard's smoking-fuse bluff.",
+    setting: { place: "Caribbean, Golden Age of Piracy", year: 1717 },
+    protagonist: "bb",
+    supporting: ["helm1", "mcap"],
+    beats: [
+      { t: 0.35, kind: "hook", note: "How could a handful of pirates capture giant merchant ships?" },
+      { t: 6.6, kind: "setting", note: "The sloop: one mast, shallow hull, hidden coves" },
+      { t: 20.5, kind: "conflict", note: "Broadside, muskets and cutlasses" },
+      { t: 27.4, kind: "escalation", note: "Black flag = mercy, red flag = no quarter" },
+      { t: 49.5, kind: "twist", note: "Blackbeard's smoking fuses make crews surrender without a fight" },
+      { t: 55.5, kind: "resolution", note: "Fear, speed and firepower" },
+    ],
+  },
   ships, chars,
   islands: [
     { id: "isl2", at: [358, 16], radius: 32, peak: 9, seed: 3, palms: 16, rot: 0.4 },
@@ -242,8 +256,10 @@ export const pirates: Episode = {
     { t: 16.35, dur: 0.8, kind: "spray", dir: 1 },
     { t: 20.2, dur: 0.9, kind: "hull", dir: -1 },
     { t: 27.2, dur: 1.0, kind: "smoke", dir: 1 },
+    { t: 31.6, dur: 0.8, kind: "spray", dir: -1 }, // hides the jump from the captain close-up to the ship
     { t: 34.2, dur: 0.9, kind: "sail", dir: -1 },
     { t: 41.2, dur: 1.0, kind: "hull", dir: 1 },
+    { t: 53.2, dur: 0.9, kind: "smoke", dir: 1 }, // the fuse smoke carries the whip-pan to the surrendering ship
   ],
   shakes: [
     ...gunPorts.map((_, i) => ({ t: 22.3 + i * 0.14, amp: 3, dur: 0.35 })),
